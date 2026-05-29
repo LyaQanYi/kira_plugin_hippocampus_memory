@@ -1,0 +1,16 @@
+{
+    "display_name": "Hippocampus Memory",
+    "plugin_id": "kira_plugin_hippocampus_memory",
+    "version": "0.1.0",
+    "author": "humiao2007@gmail.com",
+    "description": "Dual-brain long-term memory: TOML+SQLite/FTS5 store, hippocampus extraction, dimensional reflection, decay-forgetting, entity profiles, three-tier persona evolution. Ports KiraAI-lightning memory system.",
+    "repo": null,
+    "tags": ["memory", "hippocampus", "ltm"],
+    "uninstallable": true,
+    "locales": {
+        "zh": {
+            "display_name": "海马体记忆",
+            "description": "双脑长期记忆：TOML+SQLite/FTS5 存储、海马体抽取、升维反思、衰减遗忘、实体画像、三级人设演进漏斗。移植自 KiraAI-lightning。"
+        }
+    }
+}

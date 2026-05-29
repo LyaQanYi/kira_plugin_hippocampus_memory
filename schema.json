@@ -1,0 +1,160 @@
+{
+    "enable_recall": {
+        "type": "switch",
+        "name": "Enable recall injection",
+        "default": true,
+        "hint": "Inject recalled memories into the LLM 'memory' system prompt section.",
+        "locales": {
+            "zh": {
+                "name": "启用记忆召回",
+                "hint": "向 system prompt 的 memory 段注入召回结果"
+            }
+        }
+    },
+    "recall_top_k": {
+        "type": "integer",
+        "name": "Recall top-K",
+        "default": 5,
+        "hint": "Max memories per recall.",
+        "locales": {
+            "zh": {
+                "name": "召回 Top-K",
+                "hint": "每次召回返回的最大记忆数"
+            }
+        }
+    },
+    "max_recall_chars": {
+        "type": "integer",
+        "name": "Max recall block chars",
+        "default": 1500,
+        "hint": "Truncate recall block to N chars before injecting.",
+        "locales": {
+            "zh": {
+                "name": "召回文本最大长度",
+                "hint": "注入到 prompt 前截断的字符数"
+            }
+        }
+    },
+    "hippocampus_chunk_threshold": {
+        "type": "integer",
+        "name": "Hippocampus trigger (chunks)",
+        "default": 3,
+        "hint": "Conversation chunks to accumulate before background extraction.",
+        "locales": {
+            "zh": {
+                "name": "海马体触发阈值",
+                "hint": "对话块累积到此数量后触发后台提取"
+            }
+        }
+    },
+    "reflection_threshold": {
+        "type": "integer",
+        "name": "Reflection trigger (facts)",
+        "default": 5,
+        "hint": "Facts count per entity to trigger reflection generation.",
+        "locales": {
+            "zh": {
+                "name": "升维反思阈值",
+                "hint": "每实体 facts 数达到此值时生成 reflection"
+            }
+        }
+    },
+    "extraction_model": {
+        "type": "model_select",
+        "model_type": "llm",
+        "name": "Extraction model",
+        "default": "",
+        "hint": "LLM for fact extraction (empty = use default fast LLM).",
+        "locales": {
+            "zh": {
+                "name": "事实提取模型",
+                "hint": "用于事实提取的 LLM（留空则用默认 fast LLM）"
+            }
+        }
+    },
+    "reflection_model": {
+        "type": "model_select",
+        "model_type": "llm",
+        "name": "Reflection model",
+        "default": "",
+        "hint": "LLM for high-level reflection (empty = use default LLM).",
+        "locales": {
+            "zh": {
+                "name": "反思模型",
+                "hint": "用于升维反思的 LLM（留空则用默认 LLM）"
+            }
+        }
+    },
+    "decay_interval_hours": {
+        "type": "integer",
+        "name": "Decay cycle interval (hours)",
+        "default": 24,
+        "hint": "How often the forgetting cycle runs. Set 0 to disable.",
+        "locales": {
+            "zh": {
+                "name": "遗忘周期间隔（小时）",
+                "hint": "衰减遗忘任务运行间隔，0 = 关闭"
+            }
+        }
+    },
+    "persona_evolution_interval_hours": {
+        "type": "integer",
+        "name": "Persona evolution interval (hours)",
+        "default": 168,
+        "hint": "How often the three-tier persona funnel runs (default = 7 days).",
+        "locales": {
+            "zh": {
+                "name": "人设演进间隔（小时）",
+                "hint": "三级人设漏斗运行间隔（默认 7 天）"
+            }
+        }
+    },
+    "enable_persona_evolution": {
+        "type": "switch",
+        "name": "Enable Tier-3 persona leap",
+        "default": false,
+        "hint": "Allow reflections to merge into persona (destructive). Off by default.",
+        "locales": {
+            "zh": {
+                "name": "启用三级人设跃迁",
+                "hint": "允许 Reflection 合并到核心人设（破坏性，默认关闭）"
+            }
+        }
+    },
+    "enable_self_awareness": {
+        "type": "switch",
+        "name": "Enable self-awareness capture",
+        "default": true,
+        "hint": "Capture bot's self-reflections (Phase 1, write-only).",
+        "locales": {
+            "zh": {
+                "name": "启用自我觉察采集",
+                "hint": "采集 Bot 自身行为反思（Phase 1，只写不读）"
+            }
+        }
+    },
+    "auto_disable_simple_memory": {
+        "type": "switch",
+        "name": "Auto-disable simple memory",
+        "default": true,
+        "hint": "Disable kira_plugin_simple_memory on startup if enabled.",
+        "locales": {
+            "zh": {
+                "name": "自动禁用 simple_memory",
+                "hint": "启动时若发现 kira_plugin_simple_memory 仍启用则自动禁用"
+            }
+        }
+    },
+    "migrate_simple_memory_on_first_run": {
+        "type": "switch",
+        "name": "Migrate simple memory data",
+        "default": true,
+        "hint": "One-shot import simple_memory's core.txt lines as facts.",
+        "locales": {
+            "zh": {
+                "name": "迁移 simple_memory 数据",
+                "hint": "首次启动一次性导入 simple_memory 的 core.txt"
+            }
+        }
+    }
+}

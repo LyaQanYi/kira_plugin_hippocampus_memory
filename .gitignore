@@ -1,0 +1,116 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ===== 测试 / 覆盖率 =====
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# ===== 类型检查 / lint =====
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ===== 虚拟环境 =====
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# ===== Jupyter =====
+.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# ===== IDE / 编辑器 =====
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# ===== 操作系统 =====
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ===== 日志 / 临时文件 =====
+*.log
+logs/
+*.tmp
+*.bak
+*.orig
+
+# ===== 本地配置 / 密钥 =====
+*.local
+.env.local
+.env.*.local
+secrets.json
+config.local.*
+
+# ===== 插件运行时数据 =====
+# memory_root 由宿主在 initialize() 时注入，
+# 但如果有人把 data/ 放在仓库内做本地调试，避免误提交
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

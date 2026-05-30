@@ -104,6 +104,12 @@ class HippocampusManager:
     def set_persona_manager(self, persona_manager) -> None:
         self.persona_engine.set_persona_manager(persona_manager)
 
+    def set_persona_brief(self, persona_brief: str) -> None:
+        """Give the extractor the bot's persona so subjective extractions
+        (group atmosphere, reflections, self-awareness) are judged in-character
+        rather than from a neutral observer's view (issue #4). Read-only."""
+        self.extractor.set_persona_brief(persona_brief)
+
     async def async_init(self) -> None:
         """Rebuild the SQLite index from TOML files on disk (disaster recovery)."""
         try:

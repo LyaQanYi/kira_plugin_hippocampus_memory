@@ -80,6 +80,12 @@ Key switches:
 - `auto_disable_simple_memory` / `migrate_simple_memory_on_first_run`: control
   the takeover behavior.
 - `enable_persona_evolution`: opt in to Tier-3 persona leap (destructive).
+- `enable_persona_perspective`: feed the bot's persona (read-only) into
+  **subjective** extractions only — group atmosphere, reflections and
+  self-awareness — so they read in-character (a noise-averse persona records
+  "too loud" rather than a neutral "lively vibe") instead of from a neutral
+  observer's view. Objective fact extraction stays persona-blind so the
+  character's bias can't pollute hard facts. Off by default; costs extra tokens.
 
 ## HTTP API (debug)
 

@@ -347,3 +347,131 @@ def test_decay_downgrade_and_archive():
             await mgr.close()
 
     _run(run())
+
+
+# --------------------------------------------------------------------------
+# Persona perspective for subjective extraction (Issue #4)
+# --------------------------------------------------------------------------
+
+from plugins.kira_plugin_hippocampus_memory.memory.memory_extractor import (
+    MemoryExtractor,
+)
+
+
+class _StubStore:
+    """Minimal stand-in: MemoryExtractor only needs `.index` at construction,
+    and the extraction methods under test don't touch the store."""
+
+    def __init__(self):
+        self.index = None
+
+
+class RecordingLLM:
+    """Fake LLM that captures the request messages of each chat() call so a
+    test can assert whether a system (persona) prompt was attached."""
+
+    def __init__(self, scripted=None):
+        self.scripted = list(scripted or [])
+        self.idx = 0
+        self.requests = []  # captured req.messages per call
+
+    async def chat(self, req):
+        self.requests.append(list(req.messages))
+        t = self.scripted[self.idx] if self.idx < len(self.scripted) else "[]"
+        self.idx += 1
+        return _FakeResp(t)
+
+    def system_at(self, i):
+        for m in self.requests[i]:
+            if m.get("role") == "system":
+                return m.get("content", "")
+        return None
+
+    def user_at(self, i):
+        for m in self.requests[i]:
+            if m.get("role") == "user":
+                return m.get("content", "")
+        return ""
+
+
+def test_persona_perspective_injected_into_subjective_extraction():
+    """Group-fact extraction (subjective: atmosphere/culture) must get the
+    persona as a system prompt so it judges in-character."""
+    async def run():
+        ext = MemoryExtractor(_StubStore())
+        llm = RecordingLLM(["[]"])
+        ext.set_llm_client(llm)
+        ext.set_persona_brief("你是高冷怕吵的猫娘，讨厌嘈杂的环境。")
+
+        await ext.extract_group_facts("小明(1): 哈哈哈刷屏\n阿花(2): 666666")
+
+        sys_prompt = llm.system_at(0)
+        assert sys_prompt is not None
+        assert "高冷怕吵" in sys_prompt
+        # The anti-copy guard must be present so persona settings aren't
+        # recorded as conversation facts.
+        assert "绝不能" in sys_prompt and "事实" in sys_prompt
+        # The user prompt carries the in-character perspective instruction.
+        assert "主观视角" in llm.user_at(0)
+
+    _run(run())
+
+
+def test_persona_perspective_not_injected_into_objective_extraction():
+    """Personal-fact extraction is objective — persona must NOT bias it, even
+    when a persona brief is configured."""
+    async def run():
+        ext = MemoryExtractor(_StubStore())
+        llm = RecordingLLM(["[]"])
+        ext.set_llm_client(llm)
+        ext.set_persona_brief("你是高冷怕吵的猫娘。")
+
+        await ext.extract_personal_facts("小明(1): 我喜欢 Python")
+
+        assert llm.system_at(0) is None
+
+    _run(run())
+
+
+def test_subjective_extraction_neutral_without_persona():
+    """Without a persona brief, subjective extraction stays exactly as before:
+    no system prompt, no perspective clause."""
+    async def run():
+        ext = MemoryExtractor(_StubStore())
+        llm = RecordingLLM(["[]"])
+        ext.set_llm_client(llm)
+
+        await ext.extract_group_facts("小明(1): 哈哈")
+
+        assert llm.system_at(0) is None
+        assert "主观视角" not in llm.user_at(0)
+
+    _run(run())
+
+
+def test_self_awareness_uses_persona_perspective():
+    async def run():
+        ext = MemoryExtractor(_StubStore())
+        llm = RecordingLLM(["NONE"])
+        ext.set_llm_client(llm)
+        ext.set_persona_brief("你是毒舌但内心温柔的助手。")
+
+        await ext.extract_self_awareness("小明(1): 在吗\nBot: 在的")
+
+        sys_prompt = llm.system_at(0)
+        assert sys_prompt is not None and "毒舌" in sys_prompt
+
+    _run(run())
+
+
+def test_set_persona_brief_truncates_and_clears():
+    ext = MemoryExtractor(_StubStore())
+
+    ext.set_persona_brief("x" * 5000)
+    assert len(ext._persona_brief) <= 801  # cap (800) + ellipsis
+    assert ext._persona_system() is not None
+
+    # Blank/whitespace disables the feature again.
+    ext.set_persona_brief("   ")
+    assert ext._persona_brief == ""
+    assert ext._persona_system() is None

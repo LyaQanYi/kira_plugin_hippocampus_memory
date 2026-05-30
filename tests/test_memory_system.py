@@ -76,6 +76,7 @@ from plugins.kira_plugin_hippocampus_memory.memory.entity_profile import (
     EntityProfileStore,
 )
 from plugins.kira_plugin_hippocampus_memory.adapters.sender_cache import SenderCache
+from plugins.kira_plugin_hippocampus_memory.adapters.recall_query import query_from_event
 
 
 class _FakeResp:
@@ -347,3 +348,46 @@ def test_decay_downgrade_and_archive():
             await mgr.close()
 
     _run(run())
+
+
+# --------------------------------------------------------------------------
+# Recall query derivation (Issue #1)
+# --------------------------------------------------------------------------
+
+class _FakeMsg:
+    def __init__(self, message_str):
+        self.message_str = message_str
+
+
+class _FakeEvent:
+    def __init__(self, messages):
+        self.messages = messages
+
+
+def test_recall_query_from_messages_strips_envelope():
+    """inject_memory must derive the recall query from event.messages.
+
+    The built-in kira-ai plugin splices a message envelope ([date]
+    [message_id: ...] [group_name: ... group_id: ... user_nickname: ...,
+    user_id: ...] | <body>) into req.user_prompt at a higher priority. Reading
+    the per-message `message_str` instead yields the envelope-free body.
+    """
+    event = _FakeEvent([
+        _FakeMsg("我最近在学 Python，喜欢用它写脚本"),
+        _FakeMsg("[At 小助手] 帮我记一下"),
+    ])
+    query = query_from_event(event)
+
+    # Body words survive...
+    assert "Python" in query
+    assert "脚本" in query
+    # ...but none of the envelope metadata leaks into the recall query.
+    for token in ("message_id", "group_id", "group_name",
+                  "user_nickname", "user_id"):
+        assert token not in query
+
+    # No usable message text → empty, so the caller falls back to
+    # _extract_query(req).
+    assert query_from_event(_FakeEvent([])) == ""
+    assert query_from_event(_FakeEvent([_FakeMsg(""), _FakeMsg(None)])) == ""
+    assert query_from_event(object()) == ""

@@ -133,6 +133,18 @@
             }
         }
     },
+    "enable_persona_perspective": {
+        "type": "switch",
+        "name": "Persona perspective for subjective extraction",
+        "default": false,
+        "hint": "Feed the bot's persona (read-only) to subjective extractions (group atmosphere, reflections, self-awareness) so they are judged in-character instead of by a neutral observer. Costs extra tokens. Off by default.",
+        "locales": {
+            "zh": {
+                "name": "主观提取注入角色视角",
+                "hint": "把 Bot 人设（只读）喂给主观类提取（群氛围、反思、自我觉察），让其以角色视角判断而非中立旁观者，避免氛围/感受错位。会增加 token 开销，默认关闭。"
+            }
+        }
+    },
     "auto_disable_simple_memory": {
         "type": "switch",
         "name": "Auto-disable simple memory",

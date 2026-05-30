@@ -26,6 +26,10 @@ from ..adapters.llm import chat_text
 
 logger = get_logger("memory_extractor", "green")
 
+# Cap the persona brief injected into subjective extractions so the extra
+# system prompt stays cheap and can't dominate the context (issue #4).
+_PERSONA_BRIEF_MAX = 800
+
 
 class MemoryExtractor:
     """海马体：事实提取 → 去重 → 合并 → 升维"""
@@ -35,6 +39,9 @@ class MemoryExtractor:
         self.index: MemoryIndex = tree_store.index
         self._llm_client = llm_client
         self._fast_llm_client = None  # 轻量模型，用于去重/合并等低复杂度任务
+        # 角色视角简介（issue #4）：仅注入到"主观类"提取（群氛围、reflection、
+        # 自我觉察），让这些内容站在角色本人视角而非中立旁观者视角。空 = 关闭。
+        self._persona_brief = ""
 
         # 升维阈值：facts 积累达到此数量时触发反思
         self.reflection_threshold = 5
@@ -45,6 +52,36 @@ class MemoryExtractor:
     def set_fast_llm_client(self, fast_llm_client):
         """设置轻量 LLM 客户端，用于去重/合并（回退到 _llm_client）"""
         self._fast_llm_client = fast_llm_client
+
+    def set_persona_brief(self, persona_brief: str) -> None:
+        """设置角色人设简介，用于给主观类提取注入角色视角（issue #4）。
+
+        只读人设、绝不回写。空字符串则关闭（提取退回中立旁观视角）。
+        超长会截断以控制提取 token 成本。
+        """
+        text = (persona_brief or "").strip()
+        if len(text) > _PERSONA_BRIEF_MAX:
+            text = text[:_PERSONA_BRIEF_MAX].rstrip() + "…"
+        self._persona_brief = text
+
+    def _persona_system(self) -> Optional[str]:
+        """构造"角色视角"system prompt，仅用于主观类提取。
+
+        未配置人设简介时返回 None —— 此时提取保持中立旁观视角（客观事实提取
+        以及本特性关闭时都走这条路）。提示里明确"人设只是背景、不得当作对话事实"，
+        以免模型把人设设定误当成抽取到的记忆。
+        """
+        brief = self._persona_brief
+        if not brief:
+            return None
+        return (
+            "你正在以一个特定角色的身份回顾刚刚的对话。下面是你的人设简介，"
+            "它**只用来**让你站在角色本人的主观视角去体会感受（例如对群聊氛围的感觉、"
+            "对自己表现的评价），而不是让你扮演中立的旁观者。\n"
+            "铁律：人设简介只是你的背景，**绝不能**把简介里描写的设定当成这段对话里"
+            "真实发生、可被记录的事实；你的输出必须完全基于实际对话内容来推断。\n\n"
+            f"【你的人设简介】\n{brief}"
+        )
 
     @property
     def _fast_or_default(self):
@@ -114,6 +151,15 @@ class MemoryExtractor:
         if not self._llm_client:
             return []
 
+        persona_system = self._persona_system()
+        persona_clause = (
+            "\n**主观视角要求**：对于「群体氛围、群文化特征」这类带主观评价的内容，"
+            "请站在你（角色本人）的视角如实写下你的真实感受，而不是中立旁观者的口吻——"
+            "例如一个怕吵的角色面对满屏刷屏，应记成「群里太吵，让你觉得烦」，"
+            "而不是「群里氛围热闹轻松」。对「话题方向、成员关系、群内事件」等客观信息仍保持中立客观。"
+            "只依据本段对话判断，不要照搬人设设定。\n"
+        ) if persona_system else ""
+
         prompt = f"""分析以下群聊对话片段，提取**群组级别**的信息。忽略寒暄和无意义内容。
 对话中每位用户的格式为 "昵称(ID): 内容"。
 
@@ -123,7 +169,7 @@ class MemoryExtractor:
 - 成员之间的互动关系和社交动态（如"小明和阿花经常互怼"）
 - 群内的共识、群规、惯例
 - 群内事件（如群友组织活动、群聊里发生的趣事）
-
+{persona_clause}
 对话:
 {conversation_text}
 
@@ -141,7 +187,7 @@ class MemoryExtractor:
 只输出 JSON 数组，不要有其他内容。如果没有值得记录的群组事实，输出空数组 []。"""
 
         try:
-            text = await chat_text(self._llm_client, prompt)
+            text = await chat_text(self._llm_client, prompt, system=persona_system)
             if text:
                 return self._parse_json_array(text)
         except Exception as e:
@@ -209,6 +255,12 @@ class MemoryExtractor:
         if ai_response_text:
             response_section = f"\n\n你的回复:\n{ai_response_text}"
 
+        persona_system = self._persona_system()
+        persona_clause = (
+            "\n（请结合你的角色设定来审视自己的表现是否贴合人设，"
+            "但只依据这次对话里你的实际行为来判断，不要照搬设定本身。）\n"
+        ) if persona_system else ""
+
         prompt = f"""你刚刚参与了一段对话。请回顾这次互动，思考你自己在这次对话中的**行为表现**。
 
 对话内容:
@@ -219,7 +271,7 @@ class MemoryExtractor:
 - 你处理这类话题/这类用户时有什么倾向？
 - 有没有什么做得不好的地方，或者做得特别好的地方？
 - 你注意到自己的什么习惯或模式？
-
+{persona_clause}
 **输出要求**：
 - 只关注你自己的行为模式，不要总结对话内容
 - 每条觉察必须以"我"开头（例如："我在回答技术问题时倾向于给出过于详细的解释"）
@@ -230,7 +282,7 @@ class MemoryExtractor:
 直接输出觉察内容或 NONE，不要有其他内容。"""
 
         try:
-            text = (await chat_text(self._llm_client, prompt)).strip()
+            text = (await chat_text(self._llm_client, prompt, system=persona_system)).strip()
             if not text or text.upper() == "NONE":
                 return []
             insights = [
@@ -481,13 +533,20 @@ class MemoryExtractor:
             f"{i + 1}. {f.text}" for i, f in enumerate(facts)
         )
 
+        # 洞察属于主观推断 —— 注入角色视角（issue #4）。
+        persona_system = self._persona_system()
+        persona_clause = (
+            "（请从你角色本人的主观视角来提炼这些洞察，保持与你人设一致的态度；"
+            "但只能基于上面列出的事实推断，不要照搬人设设定。）\n"
+        ) if persona_system else ""
+
         if entity_type == "group":
             prompt = f"""基于以下关于这个群聊的事实，你能推断出什么更高层面的洞察？
 比如群体性格、社交动态、群文化特征等。涉及具体成员时用昵称，不要说"该用户"。
 
 事实:
 {facts_text}
-
+{persona_clause}
 请输出 1-3 条简洁的洞察，每条一行，不需要编号。只输出洞察内容，不要有其他内容。"""
         else:
             prompt = f"""基于以下关于这位用户的事实，你能推断出什么更高层面的洞察？
@@ -495,12 +554,12 @@ class MemoryExtractor:
 
 事实:
 {facts_text}
-
+{persona_clause}
 请输出 1-3 条简洁的洞察，每条一行，不需要编号。只输出洞察内容，不要有其他内容。"""
 
         generated = []
         try:
-            text = (await chat_text(self._llm_client, prompt)).strip()
+            text = (await chat_text(self._llm_client, prompt, system=persona_system)).strip()
             if not text:
                 return []
 

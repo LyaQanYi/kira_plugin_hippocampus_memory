@@ -140,6 +140,26 @@ class HippocampusMemoryPlugin(BasePlugin):
         if persona_mgr is not None and self.plugin_cfg.get("enable_persona_evolution", False):
             self._manager.set_persona_manager(persona_mgr)
 
+        # Persona perspective for subjective extraction (issue #4): read the
+        # bot's persona (read-only, never written) so atmosphere/reflection/
+        # self-awareness are judged in-character instead of from a neutral
+        # observer's view. Independent of — and far lighter than — Tier-3
+        # evolution, so it has its own switch.
+        if persona_mgr is not None and self.plugin_cfg.get("enable_persona_perspective", False):
+            try:
+                persona = await persona_mgr.get_persona()
+                brief = (getattr(persona, "content", "") or "").strip()
+                if brief:
+                    self._manager.set_persona_brief(brief)
+                    logger.info(
+                        "Persona perspective enabled for subjective extraction "
+                        "(group atmosphere / reflections / self-awareness)."
+                    )
+                else:
+                    logger.debug("Persona perspective on, but persona text is empty.")
+            except Exception as e:
+                logger.warning(f"Could not load persona for perspective injection: {e}")
+
         # 3. One-shot migration from simple_memory's core.txt before we
         #    disable it (otherwise the file might be gone next run).
         if self.plugin_cfg.get("migrate_simple_memory_on_first_run", True):

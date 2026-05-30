@@ -27,7 +27,7 @@ pip install -r requirements.txt
 > **依赖安装**：通过 WebUI 上传 zip 安装时，KiraAI 会自动执行 `requirements.txt`。
 > 如果你是**手动**把目录拷进 `data/plugins/`，则需自己 `pip install -r requirements.txt`
 > 到 KiraAI 实际使用的 Python 环境（如 `venv`），否则会报 `No module named 'tomli_w'`。
-
+>
 > **无需 LLM 也能加载**：即使尚未配置任何默认 LLM，插件也会正常加载——召回（FTS）、
 > 手动记忆工具、迁移、自动禁用 simple_memory 都照常工作，只有后台海马体提取会休眠，
 > 待配置好 LLM 并重启后自动启用。

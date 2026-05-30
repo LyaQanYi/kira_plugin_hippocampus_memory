@@ -38,7 +38,7 @@ Restart KiraAI. The plugin is auto-discovered from `data/plugins/`.
 > `requirements.txt`. If you **manually** copy the folder into `data/plugins/`,
 > install the requirements yourself into the Python environment KiraAI actually
 > uses (e.g. its `venv`), or loading fails with `No module named 'tomli_w'`.
-
+>
 > **Loads without an LLM**: the plugin initializes even when no default LLM is
 > configured — recall (FTS), manual memory tools, migration and auto-disabling
 > simple_memory all still work; only background hippocampus extraction stays

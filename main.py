@@ -18,6 +18,7 @@ from core.provider import LLMRequest
 
 from .adapters.llm import append_to_prompt_section
 from .adapters.migration import migrate_simple_memory_if_needed
+from .adapters.recall_query import query_from_event
 from .adapters.sender_cache import SenderCache
 from .memory.manager import HippocampusManager
 from .memory.paths import set_memory_root
@@ -427,7 +428,15 @@ class HippocampusMemoryPlugin(BasePlugin):
         except ValueError:
             return
 
-        query = self._extract_query(req)
+        # Prefer the clean per-message text from the event over req.user_prompt.
+        # By the time this MEDIUM hook runs, kira-ai's SYS_HIGH hook has spliced
+        # a message envelope ([date] [message_id: ...] [group_name: ... group_id:
+        # ... user_nickname: ..., user_id: ...] | <body>) into req.user_prompt,
+        # whose generic words flood the FTS query and false-match stored facts.
+        # event.messages[*].message_str holds the envelope-free body, filled
+        # before any llm_request hook. Fall back to _extract_query(req) when the
+        # event has no usable message text.
+        query = query_from_event(event) or self._extract_query(req)
         if not query:
             return
 

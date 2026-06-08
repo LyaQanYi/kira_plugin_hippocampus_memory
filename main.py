@@ -18,7 +18,7 @@ from core.provider import LLMRequest
 
 from .adapters.llm import append_to_prompt_section
 from .adapters.migration import migrate_simple_memory_if_needed
-from .adapters.recall_query import query_from_event
+from .adapters.recall_query import query_from_event, recall_targets
 from .adapters.sender_cache import SenderCache
 from .memory.manager import HippocampusManager
 from .memory.paths import set_memory_root
@@ -441,9 +441,28 @@ class HippocampusMemoryPlugin(BasePlugin):
             return
 
         k = self._int_cfg("recall_top_k", 5)
-        memories = await self._manager.recall(
-            query=query, entity_id=entity_id, entity_type=entity_type, k=k
-        )
+
+        # Dual-path recall (mirrors KiraAI-lightning's message_manager): always
+        # recall the speaking user's own memories, and in a group additionally
+        # recall the group entity, then merge + dedup by id. Without this a group
+        # turn recalled ONLY the group entity, so a user's personal memories
+        # (learned in DM, or routed to their user entity inside the group) never
+        # surfaced — the "cross-session amnesia / often can't recall" users hit.
+        memories: list = []
+        seen_ids: set = set()
+        for tgt_id, tgt_type in recall_targets(event, entity_id, entity_type):
+            try:
+                hits = await self._manager.recall(
+                    query=query, entity_id=tgt_id, entity_type=tgt_type, k=k
+                )
+            except Exception as e:
+                logger.debug(f"Recall failed for {tgt_type}:{tgt_id}: {e}")
+                continue
+            for m in hits:
+                if m.id not in seen_ids:
+                    seen_ids.add(m.id)
+                    memories.append(m)
+
         block = self._manager.format_recalled_memories(memories)
 
         max_chars = self._int_cfg("max_recall_chars", 1500)

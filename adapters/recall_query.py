@@ -28,3 +28,60 @@ def query_from_event(event: Any) -> str:
     return " ".join(
         (getattr(m, "message_str", "") or "") for m in messages
     ).strip()
+
+
+def recall_targets(event, session_entity_id, session_entity_type):
+    """Decide which ``(entity_id, entity_type)`` scopes to recall for a turn.
+
+    Mirrors KiraAI-lightning's ``message_manager`` recall logic:
+      - always recall the **speaking user's own** entity, so personal memories
+        (learned in DM, or routed to the user entity inside a group) surface in
+        any context — this is what fixes the "cross-session amnesia" where a
+        group turn used to recall only the group entity;
+      - additionally recall the **group** entity when the turn is a group
+        message;
+      - dedup while preserving order (user first).
+
+    Falls back to the session entity when the speaker can't be resolved (e.g. a
+    DM where ``messages`` carry no sender, or a group with an unresolved sender),
+    so behaviour never regresses below the old single-entity recall.
+
+    Pure function (no ``core.*`` import) so it stays unit-testable. ``event`` is
+    duck-typed: it only needs ``.adapter.name`` and ``.messages[*].sender.user_id``.
+    """
+    targets: list = []
+    seen: set = set()
+
+    def _add(eid, etype):
+        if eid and (eid, etype) not in seen:
+            seen.add((eid, etype))
+            targets.append((eid, etype))
+
+    adapter = ""
+    adapter_obj = getattr(event, "adapter", None)
+    if adapter_obj is not None:
+        adapter = getattr(adapter_obj, "name", "") or ""
+
+    # Speaker = the most recent message's sender (matches lightning's
+    # ``event.messages[-1].sender.user_id``); scan back for the first usable id.
+    user_id = ""
+    messages = getattr(event, "messages", None) or []
+    for msg in reversed(messages):
+        sender = getattr(msg, "sender", None)
+        if sender is not None:
+            uid = getattr(sender, "user_id", "") or ""
+            if uid:
+                user_id = uid
+                break
+
+    if adapter and user_id:
+        _add(f"{adapter}:{user_id}", "user")
+
+    if session_entity_type == "group":
+        _add(session_entity_id, "group")
+
+    if not targets:
+        # Speaker unresolved → preserve the legacy single-entity behaviour.
+        _add(session_entity_id, session_entity_type)
+
+    return targets

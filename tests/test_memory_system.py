@@ -519,3 +519,49 @@ def test_recall_query_from_messages_strips_envelope():
     assert query_from_event(_FakeEvent([])) == ""
     assert query_from_event(_FakeEvent([_FakeMsg(""), _FakeMsg(None)])) == ""
     assert query_from_event(object()) == ""
+
+
+class _FakeSender:
+    def __init__(self, user_id):
+        self.user_id = user_id
+
+
+class _FakeSenderMsg:
+    def __init__(self, message_str="", user_id=""):
+        self.message_str = message_str
+        self.sender = _FakeSender(user_id) if user_id else None
+
+
+class _FakeAdapter:
+    def __init__(self, name):
+        self.name = name
+
+
+class _FakeRoutedEvent:
+    def __init__(self, adapter_name, messages):
+        self.adapter = _FakeAdapter(adapter_name)
+        self.messages = messages
+
+
+def test_recall_targets_dual_path():
+    """Recall must always include the speaking user, plus the group in a group."""
+    from plugins.kira_plugin_hippocampus_memory.adapters.recall_query import (
+        recall_targets,
+    )
+
+    # Group turn: speaker's user entity first, then the group entity.
+    grp_event = _FakeRoutedEvent("telegram", [_FakeSenderMsg("晚上好", "12345")])
+    targets = recall_targets(grp_event, "telegram:115985242", "group")
+    assert ("telegram:12345", "user") in targets, "speaker memories must be recalled in group"
+    assert ("telegram:115985242", "group") in targets, "group memories must be recalled too"
+    assert targets[0] == ("telegram:12345", "user"), "user scope should come first"
+
+    # DM turn: session entity already the user; no duplicate group scope.
+    dm_event = _FakeRoutedEvent("telegram", [_FakeSenderMsg("hi", "12345")])
+    dm_targets = recall_targets(dm_event, "telegram:12345", "user")
+    assert dm_targets == [("telegram:12345", "user")]
+
+    # Unresolved speaker → fall back to the session entity (legacy behaviour).
+    blank = _FakeRoutedEvent("telegram", [_FakeSenderMsg("hi", "")])
+    assert recall_targets(blank, "telegram:999", "group") == [("telegram:999", "group")]
+    assert recall_targets(object(), "telegram:42", "user") == [("telegram:42", "user")]

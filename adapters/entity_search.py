@@ -246,11 +246,13 @@ async def search_memories(
     resolved: List[Tuple[str, str]] = []
 
     # 1. explicit entity_id(s) — comma-separated names / QQ / ids. The group
-    #    guard is applied PER TOKEN: a single "群"-ish token is skipped rather
-    #    than discarding the whole field, so "小明,阿群" still resolves 小明.
+    #    guard is applied PER TOKEN and only to a token that ALREADY looks like a
+    #    canonical id (e.g. "platform:群123"); a bare nickname that merely
+    #    contains "群" (like "阿群") falls through to resolve_name and stays
+    #    searchable. So "小明,阿群" still resolves 小明 and tries 阿群 as a name.
     if entity_id and profile_store is not None:
         for name in (n.strip() for n in entity_id.split(",") if n.strip()):
-            if looks_like_group_id(name):
+            if looks_like_entity_id(name) and looks_like_group_id(name):
                 logger.debug("Skipping group-like token in memory_search")
                 continue
             rid = await resolve_name(profile_store, name, entity_type)

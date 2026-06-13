@@ -98,6 +98,13 @@ class HippocampusManager:
         if fast_llm_client is not None:
             self.extractor.set_fast_llm_client(fast_llm_client)
 
+    def get_fast_llm(self):
+        """The lightweight client for cheap LLM tasks (entity extraction,
+        result summarisation). Falls back to the main client, None if neither."""
+        if self.extractor is None:
+            return None
+        return self.extractor._fast_or_default
+
     def set_sender_cache(self, sender_cache) -> None:
         self.sender_cache = sender_cache
 

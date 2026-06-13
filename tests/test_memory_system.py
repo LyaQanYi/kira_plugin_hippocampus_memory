@@ -581,6 +581,8 @@ def test_entity_search_helpers():
     assert not looks_like_entity_id("小明")
     assert not looks_like_entity_id("")
     assert not looks_like_entity_id("nocolon")
+    assert not looks_like_entity_id(":12345")   # empty adapter is malformed
+    assert not looks_like_entity_id("telegram:")  # empty id is malformed
 
     assert looks_like_group_id("group:123")
     assert looks_like_group_id("我们群")
@@ -634,6 +636,16 @@ def test_memory_search_multi_user():
             # Both users resolved + searched, results labelled by entity.
             assert "telegram:111" in block and "telegram:222" in block
             assert "Python" in block and "JavaScript" in block
+
+            # Per-token group guard: a 群-ish token is skipped, not the whole
+            # field — "小明,阿群" must still resolve 小明.
+            mixed = await search_memories(
+                manager=mgr, fast_llm=mgr.get_fast_llm(), sender_cache=None,
+                sid="telegram:dm:111", query="编程", entity_id="小明,阿群",
+                entity_type="user", k=5, fallback_targets=[],
+                list_entities_fn=list_all_entities,
+            )
+            assert "Python" in mixed
 
             # Group-like entity_id is rejected → falls through to the fallback.
             fb = await search_memories(

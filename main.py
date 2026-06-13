@@ -645,7 +645,7 @@ class HippocampusMemoryPlugin(BasePlugin):
             query=q,
             entity_id=(entity_id or "").strip(),
             entity_type=entity_type or "user",
-            k=int(k or 5),
+            k=k or 5,  # search_memories normalises; don't int() here (would raise)
             fallback_targets=fallback,
             list_entities_fn=list_all_entities,
         )

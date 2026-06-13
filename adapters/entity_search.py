@@ -38,13 +38,14 @@ _TYPE_LABELS = {
 # ---------------------------------------------------------------------------
 
 def looks_like_entity_id(value: str) -> bool:
-    """True for a canonical ``adapter:id`` entity id (vs a bare nickname)."""
-    if not value:
+    """True for a canonical ``adapter:id`` entity id (vs a bare nickname).
+
+    Both halves must be non-empty — ``":12345"`` (empty adapter) is malformed and
+    must NOT pass, or it would skip name resolution and reach recall as-is."""
+    if not value or ":" not in value:
         return False
-    if ":" in value:
-        parts = value.split(":", 1)
-        return len(parts) == 2 and len(parts[1]) > 0
-    return False
+    adapter, _, ident = value.partition(":")
+    return bool(adapter) and bool(ident)
 
 
 def looks_like_group_id(value: str) -> bool:
@@ -85,7 +86,9 @@ async def resolve_name(profile_store, name: str, entity_type: str) -> str:
         logger.debug(f"resolve_entity_by_name failed for {name!r}: {e}")
         return ""
     if resolved:
-        logger.info(f"Nickname resolved: {name!r} -> {resolved} ({entity_type})")
+        # debug, not info: this maps a raw name/QQ to a canonical id and we
+        # don't want those identifiers persisted in business logs by default.
+        logger.debug(f"Nickname resolved -> {entity_type} entity")
         return resolved
     return ""
 
@@ -240,16 +243,16 @@ async def search_memories(
 
     profile_store = getattr(manager, "profile_store", None)
 
-    # A group reference fat-fingered into entity_id → treat as not provided.
-    if entity_id and looks_like_group_id(entity_id):
-        logger.warning(f"Rejected group-like entity_id {entity_id!r}; auto-resolving")
-        entity_id = ""
-
     resolved: List[Tuple[str, str]] = []
 
-    # 1. explicit entity_id(s)
+    # 1. explicit entity_id(s) — comma-separated names / QQ / ids. The group
+    #    guard is applied PER TOKEN: a single "群"-ish token is skipped rather
+    #    than discarding the whole field, so "小明,阿群" still resolves 小明.
     if entity_id and profile_store is not None:
         for name in (n.strip() for n in entity_id.split(",") if n.strip()):
+            if looks_like_group_id(name):
+                logger.debug("Skipping group-like token in memory_search")
+                continue
             rid = await resolve_name(profile_store, name, entity_type)
             if looks_like_entity_id(rid):
                 resolved.append((rid, entity_type))

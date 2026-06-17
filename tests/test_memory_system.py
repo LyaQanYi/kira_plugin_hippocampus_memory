@@ -638,14 +638,17 @@ def test_memory_search_multi_user():
             assert "Python" in block and "JavaScript" in block
 
             # Per-token group guard: a 群-ish token is skipped, not the whole
-            # field — "小明,阿群" must still resolve 小明.
+            # field — "小明,阿群" must still resolve 小明 (and only 小明).
             mixed = await search_memories(
                 manager=mgr, fast_llm=mgr.get_fast_llm(), sender_cache=None,
                 sid="telegram:dm:111", query="编程", entity_id="小明,阿群",
                 entity_type="user", k=5, fallback_targets=[],
                 list_entities_fn=list_all_entities,
             )
-            assert "Python" in mixed
+            assert "Python" in mixed           # 小明 resolved
+            assert "JavaScript" not in mixed   # 阿群 did NOT pull in 小红
+            # (a single resolved entity isn't label-prefixed, so we assert on
+            # content exclusion rather than on the "[telegram:111]" label.)
 
             # Group-like entity_id is rejected → falls through to the fallback.
             fb = await search_memories(

@@ -565,3 +565,100 @@ def test_recall_targets_dual_path():
     blank = _FakeRoutedEvent("telegram", [_FakeSenderMsg("hi", "")])
     assert recall_targets(blank, "telegram:999", "group") == [("telegram:999", "group")]
     assert recall_targets(object(), "telegram:42", "user") == [("telegram:42", "user")]
+
+
+# --------------------------------------------------------------------------
+# Cross-user memory_search (entity_search)
+# --------------------------------------------------------------------------
+
+def test_entity_search_helpers():
+    from plugins.kira_plugin_hippocampus_memory.adapters.entity_search import (
+        looks_like_entity_id,
+        looks_like_group_id,
+    )
+
+    assert looks_like_entity_id("telegram:123")
+    assert not looks_like_entity_id("小明")
+    assert not looks_like_entity_id("")
+    assert not looks_like_entity_id("nocolon")
+    assert not looks_like_entity_id(":12345")   # empty adapter is malformed
+    assert not looks_like_entity_id("telegram:")  # empty id is malformed
+
+    assert looks_like_group_id("group:123")
+    assert looks_like_group_id("我们群")
+    assert not looks_like_group_id("telegram:123")
+    assert not looks_like_group_id("小明")
+
+
+def test_memory_search_multi_user():
+    """memory_search resolves nicknames and searches multiple users in parallel."""
+    from plugins.kira_plugin_hippocampus_memory.adapters.entity_search import (
+        search_memories,
+    )
+    from plugins.kira_plugin_hippocampus_memory.memory.paths import list_all_entities
+
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 1,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+            # fast LLM returns "" for the multi-entity summary → keep the raw
+            # merged block so we can assert both users' memories are present.
+            mgr.set_clients(llm_client=FakeLLM([]), fast_llm_client=FakeLLM([""]))
+
+            await mgr.add_fact("小明喜欢用 Python 编程", entity_id="telegram:111",
+                               entity_type="user", importance=6)
+            await mgr.add_fact("小红喜欢用 JavaScript 编程", entity_id="telegram:222",
+                               entity_type="user", importance=6)
+            # Profiles give the nicknames resolve_entity_by_name matches on.
+            await mgr.profile_store.increment_interaction("telegram:111", nickname="小明")
+            await mgr.profile_store.increment_interaction("telegram:222", nickname="小红")
+
+            block = await search_memories(
+                manager=mgr,
+                fast_llm=mgr.get_fast_llm(),
+                sender_cache=None,
+                sid="telegram:dm:111",
+                query="编程",
+                entity_id="小明,小红",       # two nicknames, comma-separated
+                entity_type="user",
+                k=5,
+                fallback_targets=[],
+                list_entities_fn=list_all_entities,
+            )
+
+            # Both users resolved + searched, results labelled by entity.
+            assert "telegram:111" in block and "telegram:222" in block
+            assert "Python" in block and "JavaScript" in block
+
+            # Per-token group guard: a 群-ish token is skipped, not the whole
+            # field — "小明,阿群" must still resolve 小明 (and only 小明).
+            mixed = await search_memories(
+                manager=mgr, fast_llm=mgr.get_fast_llm(), sender_cache=None,
+                sid="telegram:dm:111", query="编程", entity_id="小明,阿群",
+                entity_type="user", k=5, fallback_targets=[],
+                list_entities_fn=list_all_entities,
+            )
+            assert "Python" in mixed           # 小明 resolved
+            assert "JavaScript" not in mixed   # 阿群 did NOT pull in 小红
+            # (a single resolved entity isn't label-prefixed, so we assert on
+            # content exclusion rather than on the "[telegram:111]" label.)
+
+            # Group-like entity_id is rejected → falls through to the fallback.
+            fb = await search_memories(
+                manager=mgr, fast_llm=None, sender_cache=None,
+                sid="telegram:gm:999", query="编程", entity_id="我们群",
+                k=5, fallback_targets=[("telegram:111", "user")],
+                list_entities_fn=list_all_entities,
+            )
+            assert "Python" in fb  # fell back to the provided target
+
+            await mgr.close()
+
+    _run(run())

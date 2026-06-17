@@ -53,6 +53,10 @@ class MemoryExtractor:
         """设置轻量 LLM 客户端，用于去重/合并（回退到 _llm_client）"""
         self._fast_llm_client = fast_llm_client
 
+    def get_fast_client(self):
+        """Public accessor for the fast (or fallback) LLM client."""
+        return self._fast_or_default
+
     def set_persona_brief(self, persona_brief: str) -> None:
         """设置角色人设简介，用于给主观类提取注入角色视角（issue #4）。
 

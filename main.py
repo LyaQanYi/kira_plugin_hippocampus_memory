@@ -19,9 +19,10 @@ from core.provider import LLMRequest
 from .adapters.llm import append_to_prompt_section
 from .adapters.migration import migrate_simple_memory_if_needed
 from .adapters.recall_query import query_from_event, recall_targets
+from .adapters.entity_search import search_memories
 from .adapters.sender_cache import SenderCache
 from .memory.manager import HippocampusManager
-from .memory.paths import set_memory_root
+from .memory.paths import list_all_entities, set_memory_root
 
 
 # Copied verbatim from kira_plugin_simple_memory so the LLM still sees the
@@ -577,7 +578,11 @@ class HippocampusMemoryPlugin(BasePlugin):
 
     @register.tool(
         name="memory_search",
-        description="主动检索长期记忆（按语义/关键词查找相关 fact 与 reflection）",
+        description=(
+            "搜索长期记忆（fact 与 reflection）。省略 entity_id 时系统会自动识别"
+            "对话中涉及的用户，并支持同时搜索多个用户的记忆（并行 + 汇总）。"
+            "大多数情况下不需要传 entity_id，直接传 query 即可。"
+        ),
         params={
             "type": "object",
             "properties": {
@@ -585,31 +590,65 @@ class HippocampusMemoryPlugin(BasePlugin):
                     "type": "string",
                     "description": "查询关键词或自然语言问题",
                 },
+                "entity_id": {
+                    "type": "string",
+                    "description": (
+                        "目标用户：可传昵称、曾用名或 QQ 号，系统自动匹配；"
+                        "逗号分隔可同时搜多个用户（如 '小明,小红'）。"
+                        "没有明确目标时省略，系统会自动识别对话涉及的用户。"
+                    ),
+                },
+                "entity_type": {
+                    "type": "string",
+                    "description": "实体类型（默认 user）",
+                    "enum": ["user", "group", "channel"],
+                },
                 "k": {
                     "type": "number",
-                    "description": "返回的最大记忆数（默认 5）",
+                    "description": "每个实体返回的最大记忆数（默认 5）",
                 },
             },
             "required": ["query"],
         },
     )
-    async def memory_search(self, event, *_, query: str, k: int = 5) -> str:
+    async def memory_search(
+        self,
+        event,
+        *_,
+        query: str,
+        entity_id: str = "",
+        entity_type: str = "user",
+        k: int = 5,
+    ) -> str:
         if self._manager is None:
             return "Memory plugin not initialized"
+        q = (query or "").strip()
+        if not q:
+            return "Empty query"
+
         sid = self._resolve_session(event) if event is not None else ""
-        entity_id, entity_type = ("", "user")
+        # Dual-recall fallback (speaking user + group) for when no specific
+        # subject can be resolved — keeps a group query from finding nothing.
+        fallback: list = []
         if sid:
             try:
-                entity_id, entity_type = self._manager._parse_entity_from_session(sid)
+                seid, setype = self._manager._parse_entity_from_session(sid)
+                fallback = recall_targets(event, seid, setype)
             except ValueError:
                 pass
-        memories = await self._manager.recall(
-            query=query.strip(),
-            entity_id=entity_id,
-            entity_type=entity_type,
-            k=int(k or 5),
+
+        block = await search_memories(
+            manager=self._manager,
+            fast_llm=self._manager.get_fast_llm(),
+            sender_cache=self._sender_cache,
+            sid=sid,
+            query=q,
+            entity_id=(entity_id or "").strip(),
+            entity_type=entity_type or "user",
+            k=k or 5,  # search_memories normalises; don't int() here (would raise)
+            fallback_targets=fallback,
+            list_entities_fn=list_all_entities,
         )
-        block = self._manager.format_recalled_memories(memories)
         return block or "暂无相关长期记忆"
 
     # ==================================================================

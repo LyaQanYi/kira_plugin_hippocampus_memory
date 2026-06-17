@@ -103,7 +103,7 @@ class HippocampusManager:
         result summarisation). Falls back to the main client, None if neither."""
         if self.extractor is None:
             return None
-        return self.extractor._fast_or_default
+        return self.extractor.get_fast_client()
 
     def set_sender_cache(self, sender_cache) -> None:
         self.sender_cache = sender_cache

@@ -15,22 +15,19 @@ so the orchestrator is unit-testable with a fake LLM + a real manager.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 from core.logging_manager import get_logger
 
 from .llm import chat_text
+from ..memory.manager import _TYPE_LABELS  # single source of truth for labels
 
 logger = get_logger("hippocampus.entity_search", "cyan")
 
 
-_TYPE_LABELS = {
-    "fact": "事实",
-    "reflection": "洞察",
-    "episodic": "事件",
-    "skill": "技能",
-    "summary": "摘要",
-}
+# How many user entities to fold into the fast-LLM "known users" hint. Bounds
+# both the sequential profile reads and the prompt size at scale.
+_MAX_HINT_USERS = 50
 
 
 # ---------------------------------------------------------------------------
@@ -110,19 +107,32 @@ def conversation_context(sender_cache, sid: str, *, limit: int = 10) -> str:
         text = (item.get("text") or "").strip()
         if not text:
             continue
+        if len(text) > 200:  # cap per message so one huge message can't dominate
+            text = text[:200] + "…"
         who = item.get("nickname") or item.get("user_id") or "User"
         lines.append(f"{who}: {text}")
-    return "\n".join(lines)[-800:]
+    # Join whole lines (already capped by `limit` and per-message length) — do
+    # not char-slice the joined string, which would cut a line mid-word.
+    return "\n".join(lines)
 
 
 async def known_users_hint(profile_store, list_entities_fn) -> str:
-    """A `entity_id -> names` listing to help the fast LLM map names to people."""
+    """A `entity_id -> names` listing to help the fast LLM map names to people.
+
+    Capped at ``_MAX_HINT_USERS`` and fetched concurrently: an unbounded
+    sequential scan would add one I/O round-trip per user before the first
+    search result and could push the hint past a small LLM's context window."""
     try:
+        entities = list(list_entities_fn("user"))[:_MAX_HINT_USERS]
+        if not entities:
+            return ""
+        profiles = await asyncio.gather(
+            *(profile_store.get_profile(eid, etype) for eid, etype in entities),
+            return_exceptions=True,
+        )
         users = []
-        for eid, etype in list_entities_fn("user"):
-            try:
-                profile = await profile_store.get_profile(eid, etype)
-            except Exception:
+        for (eid, _etype), profile in zip(entities, profiles):
+            if isinstance(profile, Exception):
                 continue
             names = []
             if profile.name:
@@ -266,9 +276,9 @@ async def search_memories(
             hint = await known_users_hint(profile_store, list_entities_fn)
         context = conversation_context(sender_cache, sid)
         for name in await extract_subjects(fast_llm, query, context, hint):
-            rid = await resolve_name(profile_store, name, "user")
+            rid = await resolve_name(profile_store, name, entity_type)
             if looks_like_entity_id(rid):
-                resolved.append((rid, "user"))
+                resolved.append((rid, entity_type))
 
     # 3. dual-recall fallback (speaker user + group)
     if not resolved and fallback_targets:

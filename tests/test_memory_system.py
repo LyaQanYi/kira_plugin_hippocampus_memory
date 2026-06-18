@@ -1073,3 +1073,53 @@ def test_list_editable_memories_spans_facts_and_reflections():
             await mgr.close()
 
     _run(run())
+
+
+def test_memory_search_auto_extract_gated():
+    """The LLM auto-detect path runs only when allow_auto_extract=True."""
+    from plugins.kira_plugin_hippocampus_memory.adapters.entity_search import (
+        search_memories,
+    )
+    from plugins.kira_plugin_hippocampus_memory.memory.paths import list_all_entities
+
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 1,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+            await mgr.add_fact("小明喜欢吃辣", entity_id="telegram:111",
+                               entity_type="user", importance=6)
+            await mgr.profile_store.increment_interaction("telegram:111", nickname="小明")
+
+            # No entity_id. Flag OFF → fast LLM must NOT be consulted; only the
+            # fallback target is searched.
+            fake_off = FakeLLM(["小明"])  # would resolve 小明 if it were called
+            mgr.set_clients(llm_client=fake_off, fast_llm_client=fake_off)
+            off = await search_memories(
+                manager=mgr, fast_llm=mgr.get_fast_llm(), sender_cache=None,
+                sid="telegram:dm:999", query="谁喜欢吃辣", entity_id="",
+                k=5, fallback_targets=[("telegram:999", "user")],
+                list_entities_fn=list_all_entities, allow_auto_extract=False,
+            )
+            assert fake_off.idx == 0, "auto-extract LLM must not run when gated off"
+            assert "吃辣" not in off  # 小明 not reached; only the (empty) fallback
+
+            # Flag ON → fast LLM extracts 小明 → resolves → search finds the fact.
+            fake_on = FakeLLM(["小明"])
+            mgr.set_clients(llm_client=fake_on, fast_llm_client=fake_on)
+            on = await search_memories(
+                manager=mgr, fast_llm=mgr.get_fast_llm(), sender_cache=None,
+                sid="telegram:dm:999", query="谁喜欢吃辣", entity_id="",
+                k=5, fallback_targets=[], list_entities_fn=list_all_entities,
+                allow_auto_extract=True,
+            )
+            assert "吃辣" in on
+
+            await mgr.close()
+
+    _run(run())

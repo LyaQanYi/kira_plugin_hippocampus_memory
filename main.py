@@ -645,9 +645,9 @@ class HippocampusMemoryPlugin(BasePlugin):
     @register.tool(
         name="memory_search",
         description=(
-            "搜索长期记忆（fact 与 reflection）。省略 entity_id 时系统会自动识别"
-            "对话中涉及的用户，并支持同时搜索多个用户的记忆（并行 + 汇总）。"
-            "大多数情况下不需要传 entity_id，直接传 query 即可。"
+            "搜索长期记忆（fact 与 reflection）。**搜某个特定用户时，请把该用户的"
+            "昵称 / 曾用名 / QQ 号传入 entity_id**（逗号分隔可同时搜多个）。"
+            "省略 entity_id 则只搜当前对话的用户与所在群。"
         ),
         params={
             "type": "object",
@@ -659,9 +659,9 @@ class HippocampusMemoryPlugin(BasePlugin):
                 "entity_id": {
                     "type": "string",
                     "description": (
-                        "目标用户：可传昵称、曾用名或 QQ 号，系统自动匹配；"
+                        "目标用户：传昵称、曾用名或 QQ 号，系统自动匹配；"
                         "逗号分隔可同时搜多个用户（如 '小明,小红'）。"
-                        "没有明确目标时省略，系统会自动识别对话涉及的用户。"
+                        "想查某个具体的人时务必填这个；省略则只搜当前对话用户与所在群。"
                     ),
                 },
                 "entity_type": {
@@ -714,6 +714,11 @@ class HippocampusMemoryPlugin(BasePlugin):
             k=k or 5,  # search_memories normalises; don't int() here (would raise)
             fallback_targets=fallback,
             list_entities_fn=list_all_entities,
+            # LLM-driven "guess which users this query is about" — extra LLM
+            # round-trip + fragile; opt-in, default off.
+            allow_auto_extract=bool(
+                self.plugin_cfg.get("enable_search_auto_detect", False)
+            ),
         )
         return block or "暂无相关长期记忆"
 

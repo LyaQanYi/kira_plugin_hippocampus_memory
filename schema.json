@@ -71,6 +71,18 @@
             }
         }
     },
+    "enable_search_auto_detect": {
+        "type": "switch",
+        "name": "memory_search auto-detect users",
+        "default": false,
+        "hint": "When memory_search gets no entity_id, use the fast LLM to guess which users the query is about. Off by default (extra LLM call + can mis-resolve); when off, search uses the explicit entity_id or the current user/group only.",
+        "locales": {
+            "zh": {
+                "name": "memory_search 自动识别用户",
+                "hint": "memory_search 未传 entity_id 时，用 fast LLM 猜测查询涉及哪些用户。默认关闭（多一次 LLM 调用且可能解析错）；关闭时只按显式 entity_id 或当前用户/群搜索"
+            }
+        }
+    },
     "reflection_threshold": {
         "type": "integer",
         "name": "Reflection trigger (facts)",

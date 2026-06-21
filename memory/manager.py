@@ -613,9 +613,13 @@ class HippocampusManager:
             except Exception as e:
                 # Tolerate a single bad profile read, but don't swallow it
                 # silently — a quiet failure here just degrades extraction
-                # quality with no trace. Log the *type* only (no raw id), per
-                # the plugin's convention of keeping identifiers out of logs.
-                logger.debug(f"Skipping a sender profile in extraction context: {e}")
+                # quality with no trace. Log the exception *type* only: its
+                # str() can embed the profile path (which contains the entity
+                # id), and the plugin keeps identifiers out of business logs.
+                logger.debug(
+                    f"Skipping a sender profile in extraction context: "
+                    f"{type(e).__name__}"
+                )
                 continue
 
         if not parts:

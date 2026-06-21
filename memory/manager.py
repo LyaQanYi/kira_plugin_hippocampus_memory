@@ -610,7 +610,12 @@ class HippocampusManager:
                     info.append(f"已知事实: {'; '.join(profile.facts[:5])}")
                 if info:
                     parts.append(f"【{label}】 {' | '.join(info)}")
-            except Exception:
+            except Exception as e:
+                # Tolerate a single bad profile read, but don't swallow it
+                # silently — a quiet failure here just degrades extraction
+                # quality with no trace. Log the *type* only (no raw id), per
+                # the plugin's convention of keeping identifiers out of logs.
+                logger.debug(f"Skipping a sender profile in extraction context: {e}")
                 continue
 
         if not parts:

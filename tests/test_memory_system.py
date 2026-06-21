@@ -662,3 +662,55 @@ def test_memory_search_multi_user():
             await mgr.close()
 
     _run(run())
+
+
+# --------------------------------------------------------------------------
+# Sender-profile extraction context (ported from lightning memory_manager:
+# _build_sender_profiles_context — prepended to the conversation before the
+# hippocampus extracts, so the LLM avoids re-recording already-known facts)
+# --------------------------------------------------------------------------
+
+def test_build_sender_profiles_context():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 1,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+
+            # Seed a known profile for telegram:111.
+            await mgr.profile_store.update_profile(
+                "telegram:111",
+                name="小明",
+                nickname="小明明",       # differs from name → shown as 当前昵称
+                aliases=["阿明"],
+            )
+            await mgr.profile_store.add_trait("telegram:111", "内向")
+            await mgr.profile_store.add_fact("telegram:111", "喜欢 Python")
+
+            ctx = await mgr._build_sender_profiles_context("telegram", ["111"])
+
+            # Header + per-field rendering, all faithful to lightning's strings.
+            assert "## 参与者已知信息" in ctx
+            assert "【小明】" in ctx            # label prefers name
+            assert "名字: 小明" in ctx
+            assert "当前昵称: 小明明" in ctx
+            assert "曾用名: 阿明" in ctx
+            assert "特征: 内向" in ctx
+            assert "已知事实: 喜欢 Python" in ctx
+            # Never leak the raw system entity_id into the extraction prompt.
+            assert "telegram:111" not in ctx
+
+            # No senders → empty string (skip the prepend entirely).
+            assert await mgr._build_sender_profiles_context("telegram", []) == ""
+
+            # Unknown sender (no profile, no info) → empty string, not a header.
+            assert await mgr._build_sender_profiles_context("telegram", ["999"]) == ""
+
+            await mgr.close()
+
+    _run(run())

@@ -19,7 +19,11 @@ from core.provider import LLMRequest
 from .adapters.llm import append_to_prompt_section
 from .adapters.migration import migrate_simple_memory_if_needed
 from .adapters.recall_query import query_from_event, recall_targets, sender_users
-from .adapters.entity_search import search_memories, looks_like_entity_id
+from .adapters.entity_search import (
+    search_memories,
+    looks_like_entity_id,
+    looks_like_group_id,
+)
 from .adapters.sender_cache import SenderCache
 from .memory.manager import HippocampusManager
 from .memory.paths import list_all_entities, set_memory_root
@@ -335,6 +339,22 @@ class HippocampusMemoryPlugin(BasePlugin):
             return session.sid
         return ""
 
+    @staticmethod
+    def _coerce_index(value) -> Optional[int]:
+        """Parse a tool ``index`` arg to an int, REJECTING non-integral values.
+
+        A bare ``int(1.9)`` silently truncates to 1, so memory_update/remove could
+        edit or delete the wrong memory. Returns None on anything non-integral or
+        unparseable so the caller surfaces the numbered list instead of acting on
+        a guessed index."""
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not f.is_integer():
+            return None
+        return int(f)
+
     # ==================================================================
     # Hooks
     # ==================================================================
@@ -442,8 +462,10 @@ class HippocampusMemoryPlugin(BasePlugin):
                 )
             except Exception as e:
                 logger.debug(f"Profile injection skipped: {e}")
+            # Only truncate on a positive cap; a 0/negative value (bad WebUI
+            # input) means "don't truncate" rather than a broken negative slice.
             max_profile = self._int_cfg("max_profile_chars", 800)
-            if profile_block and len(profile_block) > max_profile:
+            if profile_block and max_profile > 0 and len(profile_block) > max_profile:
                 profile_block = profile_block[:max_profile] + "\n…(truncated)"
 
         # --- Recalled memories (RAG).
@@ -556,7 +578,7 @@ class HippocampusMemoryPlugin(BasePlugin):
             "type": "object",
             "properties": {
                 "index": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "要修改的记忆编号",
                 },
                 "text": {
@@ -573,15 +595,15 @@ class HippocampusMemoryPlugin(BasePlugin):
         sid = self._resolve_session(event) if event is not None else ""
         if not sid:
             return "Cannot resolve session"
+        text = (text or "").strip()
+        if not text:
+            return "Empty memory text"
+        idx = self._coerce_index(index)
         mems = await self._manager.list_editable_memories(sid)
-        try:
-            idx = int(index)
-        except (TypeError, ValueError):
-            idx = -1
-        if idx < 0 or idx >= len(mems):
+        if idx is None or idx < 0 or idx >= len(mems):
             listing = self._manager.format_editable_list(mems)
             return (
-                f"编号 {idx} 超出范围。当前可编辑记忆：\n{listing}"
+                f"编号 {index} 无效或超出范围。当前可编辑记忆：\n{listing}"
                 if listing
                 else "当前没有可修改的记忆"
             )
@@ -595,7 +617,7 @@ class HippocampusMemoryPlugin(BasePlugin):
             "type": "object",
             "properties": {
                 "index": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "要删除的记忆编号",
                 },
             },
@@ -608,15 +630,12 @@ class HippocampusMemoryPlugin(BasePlugin):
         sid = self._resolve_session(event) if event is not None else ""
         if not sid:
             return "Cannot resolve session"
+        idx = self._coerce_index(index)
         mems = await self._manager.list_editable_memories(sid)
-        try:
-            idx = int(index)
-        except (TypeError, ValueError):
-            idx = -1
-        if idx < 0 or idx >= len(mems):
+        if idx is None or idx < 0 or idx >= len(mems):
             listing = self._manager.format_editable_list(mems)
             return (
-                f"编号 {idx} 超出范围。当前可删除记忆：\n{listing}"
+                f"编号 {index} 无效或超出范围。当前可删除记忆：\n{listing}"
                 if listing
                 else "当前没有可删除的记忆"
             )
@@ -732,6 +751,14 @@ class HippocampusMemoryPlugin(BasePlugin):
         if entity_id:
             if looks_like_entity_id(entity_id):
                 resolved = entity_id
+                # A canonical id carries no reliable type marker. If it's
+                # obviously group-like ("group"/"群"), prefer the group profile so
+                # a group id passed with the default entity_type=user isn't read
+                # as a non-existent user profile. (Numeric group ids are
+                # indistinguishable from user ids — the caller must set
+                # entity_type for those.)
+                if looks_like_group_id(entity_id):
+                    etype = "group"
             else:
                 # Resolve a nickname / alias / QQ number to a canonical id.
                 try:

@@ -772,6 +772,18 @@ def test_build_turn_profile_prompt_dm_and_group():
             # System entity_id must never leak into the prompt.
             assert "telegram:111" not in grp
 
+            # Group with an un-named participant → opaque ordinal label, never
+            # the bare id tail (a QQ/platform number the plugin must not leak).
+            await mgr.profile_store.add_trait("telegram:333", "潜水")  # trait, no name
+            anon_grp = await mgr.build_turn_profile_prompt(
+                [("telegram:111", "小明"), ("telegram:333", "")],
+                "telegram:999", "group", is_group=True,
+            )
+            assert "【小明】" in anon_grp
+            assert "【用户2】" in anon_grp     # un-named → 用户N, not the id tail
+            assert "333" not in anon_grp       # bare id fragment must not leak
+            assert "111" not in anon_grp
+
             # No usable profile (unknown user) → empty string, inject nothing.
             empty = await mgr.build_turn_profile_prompt(
                 [("telegram:404", "幽灵")], "telegram:404", "user", is_group=False
@@ -807,6 +819,20 @@ def test_sender_cache_take_unconsumed_watermark():
 
     # take_unconsumed does NOT delete — the full window is still visible.
     assert len(c.get_recent(sid, max_age_sec=9999)) == 3
+
+
+def test_sender_cache_bounds_sessions():
+    """_data and _consumed_seq must not grow without bound across sessions."""
+    c = SenderCache(max_sessions=3)
+    for i in range(5):
+        c.record(f"sid{i}", str(i), f"u{i}", "hi")
+        c.take_unconsumed(f"sid{i}")   # also populates _consumed_seq[sid{i}]
+
+    assert len(c._data) == 3            # oldest evicted FIFO
+    assert len(c._consumed_seq) <= 3   # watermark map pruned in lockstep
+    assert "sid0" not in c._data and "sid1" not in c._data
+    assert "sid0" not in c._consumed_seq and "sid1" not in c._consumed_seq
+    assert "sid4" in c._data
 
 
 def test_submit_exchange_carries_exact_identity():
@@ -923,6 +949,13 @@ def test_list_editable_memories_spans_facts_and_reflections():
             listing = mgr.format_editable_list(mems)
             assert listing.startswith("0. ")
             assert "1. " in listing
+
+            # Empty/whitespace update is refused — a bad call must not blank a memory.
+            assert await mgr.update_memory_at(mems, 0, "   ") is None
+            assert await mgr.update_memory_at(mems, 0, "") is None
+            # A real update still works.
+            updated = await mgr.update_memory_at(mems, 0, "改成新内容")
+            assert updated is not None and updated.raw_text == "改成新内容"
 
             # Remove by index actually deletes.
             ok = await mgr.delete_memory_at(mems, 0)

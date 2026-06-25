@@ -330,6 +330,11 @@ class HippocampusManager:
     ) -> Optional[Memory]:
         if index < 0 or index >= len(memories):
             return None
+        # Refuse to blank an existing memory: a single bad model call passing an
+        # empty string must not wipe stored content.
+        text = (text or "").strip()
+        if not text:
+            return None
         mem = memories[index]
         mem.text = text
         ok = await self.tree_store.update_memory(mem)
@@ -646,7 +651,7 @@ class HippocampusManager:
 
             if is_group and len(distinct) > 1:
                 parts: list = []
-                for eid, nick in distinct:
+                for i, (eid, nick) in enumerate(distinct):
                     try:
                         profile = await self.get_profile(eid, ENTITY_USER)
                     except Exception:
@@ -654,8 +659,11 @@ class HippocampusManager:
                     p = profile.to_prompt()
                     if not p or p == "暂无画像信息":
                         continue
-                    # Label by display name so the system entity_id never leaks.
-                    label = profile.name or profile.nickname or nick or eid.split(":")[-1]
+                    # Label by display name only. Never fall back to the raw id
+                    # tail — that's the bare platform/QQ number, which the plugin
+                    # must keep out of prompts. Use an opaque ordinal so the model
+                    # can still tell speakers apart.
+                    label = profile.name or profile.nickname or nick or f"用户{i + 1}"
                     parts.append(f"【{label}】\n{p}")
                 if not parts:
                     return ""

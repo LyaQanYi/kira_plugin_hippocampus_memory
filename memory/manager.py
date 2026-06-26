@@ -391,6 +391,14 @@ class HippocampusManager:
 
             conversation_text = self._chunks_to_text(chunks, sender_map)
 
+            # 构建 sender profile 上下文，辅助 LLM 更准确地提取和路由事实，
+            # 避免重复记录已知信息（精确复刻 lightning memory_manager 的提取增强）。
+            profile_context = await self._build_sender_profiles_context(
+                adapter, unique_senders
+            )
+            if profile_context:
+                conversation_text = f"{profile_context}\n\n{conversation_text}"
+
             if is_group:
                 personal_facts, group_facts = await asyncio.gather(
                     self.extractor.extract_personal_facts(conversation_text),
@@ -570,6 +578,57 @@ class HippocampusManager:
                 if nick:
                     sender_map.setdefault(nick.lower(), uid)
         return sender_map
+
+    async def _build_sender_profiles_context(
+        self, adapter: str, unique_senders: list
+    ) -> str:
+        """为海马体提取构建 sender profile 摘要
+
+        让 LLM 在提取事实时知道每个 sender 的已知信息（昵称、曾用名、特征等），
+        避免重复提取已有事实，并辅助 entity 路由。
+        """
+        if not unique_senders:
+            return ""
+
+        parts = []
+        for sid in unique_senders:
+            entity_id = f"{adapter}:{sid}"
+            try:
+                profile = await self.profile_store.get_profile(entity_id, ENTITY_USER)
+                # 用昵称/名字标识，避免暴露系统 entity_id
+                label = profile.name or profile.nickname or str(sid)
+                info = []
+                if profile.name:
+                    info.append(f"名字: {profile.name}")
+                if profile.nickname and profile.nickname != profile.name:
+                    info.append(f"当前昵称: {profile.nickname}")
+                if profile.aliases:
+                    info.append(f"曾用名: {', '.join(profile.aliases)}")
+                if profile.traits:
+                    info.append(f"特征: {', '.join(profile.traits)}")
+                if profile.facts:
+                    info.append(f"已知事实: {'; '.join(profile.facts[:5])}")
+                if info:
+                    parts.append(f"【{label}】 {' | '.join(info)}")
+            except Exception as e:
+                # Tolerate a single bad profile read, but don't swallow it
+                # silently — a quiet failure here just degrades extraction
+                # quality with no trace. Log the exception *type* only: its
+                # str() can embed the profile path (which contains the entity
+                # id), and the plugin keeps identifiers out of business logs.
+                logger.debug(
+                    f"Skipping a sender profile in extraction context: "
+                    f"{type(e).__name__}"
+                )
+                continue
+
+        if not parts:
+            return ""
+        return (
+            "## 参与者已知信息（以下是对话中提到的用户的已有画像，"
+            "提取事实时请避免重复记录这些已有内容）\n"
+            + "\n".join(parts)
+        )
 
     @staticmethod
     def _unique_senders(chunks: list) -> list[str]:

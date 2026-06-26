@@ -224,14 +224,19 @@ async def _resolve_source_labels(profile_store, resolved) -> dict:
         name = re.sub(r"[\[\]\r\n]+", " ", name).strip()
         token = _opaque_label(i)
         if not name:
-            # ``token`` is unique per index, but a real display name above could
-            # be literally "用户B" (== _opaque_label(1)); if so, disambiguate so
-            # two sources never share the same prefix.
-            label = token if token not in used else f"{token}#{i}"
+            label = token
         elif name in used:
             label = f"{name}({token})"
         else:
             label = name
+        # A crafted display name can coincide with the opaque token or with an
+        # already-assigned label (even a #-suffixed one); append an ordinal until
+        # the prefix is free so two sources never share a label.
+        base = label
+        n = 1
+        while label in used:
+            label = f"{base}#{n}"
+            n += 1
         used.add(label)
         labels[eid] = label
     return labels

@@ -877,6 +877,21 @@ def test_resolve_source_labels_sanitizes_and_disambiguates():
     assert labels2["telegram:11"] != "用户B"      # disambiguated, not a duplicate
     assert len(set(labels2.values())) == 2        # both sources stay distinct
 
+    # Pathological 3-entity case: the disambiguated fallback must itself stay
+    # distinct. entity0 named "用户C#2", entity1 named "用户C" (occupies the token
+    # _opaque_label(2)), entity2 nameless → token "用户C" is taken, so it must
+    # NOT land back on "用户C#2" (which entity0 already holds).
+    store3 = _Store({
+        "telegram:20": _P(name="用户C#2"),
+        "telegram:21": _P(name="用户C"),   # == _opaque_label(2)
+        "telegram:22": _P(),              # nameless at index 2 → token 用户C
+    })
+    labels3 = _run(_resolve_source_labels(
+        store3,
+        [("telegram:20", "user"), ("telegram:21", "user"), ("telegram:22", "user")],
+    ))
+    assert len(set(labels3.values())) == 3        # no two sources share a label
+
 
 # --------------------------------------------------------------------------
 # Fix #1: always-on profile injection into the live turn (parity with

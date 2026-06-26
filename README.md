@@ -101,6 +101,10 @@ Key switches:
 - `auto_disable_simple_memory` / `migrate_simple_memory_on_first_run`: control
   the takeover behavior.
 - `enable_persona_evolution`: opt in to Tier-3 persona leap (destructive).
+- `enable_search_auto_detect`: let `memory_search` use the fast LLM to guess
+  which users a query is about when no `entity_id` is given. Off by default
+  (extra LLM call + can mis-resolve); when off, `memory_search` uses the
+  explicit `entity_id` or the current user/group only.
 - `enable_persona_perspective`: feed the bot's persona (read-only) into
   **subjective** extractions only — group atmosphere, reflections and
   self-awareness — so they read in-character (a noise-averse persona records

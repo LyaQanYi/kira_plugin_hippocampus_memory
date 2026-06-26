@@ -251,18 +251,26 @@ class EntityProfileStore:
         is_numeric = query.isdigit()
         candidates = []
 
-        for eid, etype in list_all_entities(entity_type):
-            # 优先级 1：entity_id 尾部匹配（adapter:qq_number 格式）
-            # 用户传入纯 QQ 号 "123456789"，匹配 "onebot:123456789"
-            if is_numeric and eid.endswith(f":{query}"):
-                return eid
+        entities = list(list_all_entities(entity_type))
 
-            try:
-                profile = await self.get_profile(eid, etype)
-            except Exception:
+        # 优先级 1：entity_id 尾部匹配（adapter:qq_number 格式），无需读 profile
+        # 用户传入纯 QQ 号 "123456789"，匹配 "onebot:123456789"
+        if is_numeric:
+            for eid, _etype in entities:
+                if eid.endswith(f":{query}"):
+                    return eid
+
+        # 并发读取所有 profile（顺序逐个 await 在用户多时会很慢）
+        profiles = await asyncio.gather(
+            *(self.get_profile(eid, etype) for eid, etype in entities),
+            return_exceptions=True,
+        )
+
+        for (eid, _etype), profile in zip(entities, profiles):
+            if isinstance(profile, Exception):
                 continue
 
-            # 优先级 2：name/nickname/aliases 精确匹配
+            # 优先级 2：name/nickname/aliases 精确匹配（按目录顺序，第一个命中即返回）
             if profile.name and profile.name.lower() == query_lower:
                 return eid
             if profile.nickname and profile.nickname.lower() == query_lower:

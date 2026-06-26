@@ -181,26 +181,6 @@ async def extract_subjects(
     return [ln for ln in lines if ln not in ("SELF", "NONE", "UNKNOWN", "无", "")]
 
 
-async def _summarize(fast_llm, query: str, merged_text: str) -> str:
-    """Filter/rank merged multi-entity results down to what's relevant."""
-    if fast_llm is None:
-        return merged_text
-    prompt = (
-        "从以下多个用户的记忆搜索结果中，筛选出与查询最相关的内容。\n"
-        "去除完全不相关的条目，保留原始格式（包括来源用户标注），按相关性排序。\n"
-        "不要添加任何解释，直接输出筛选后的结果。\n\n"
-        f"查询：{query}\n\n"
-        f"搜索结果：\n{merged_text}\n\n"
-        "筛选后："
-    )
-    try:
-        out = (await chat_text(fast_llm, prompt)).strip()
-        return out or merged_text
-    except Exception as e:
-        logger.debug(f"summarize failed: {e}")
-        return merged_text
-
-
 def _format(memories, source_label: str, multi: bool, seen_ids: set) -> List[str]:
     lines = []
     for mem in memories:
@@ -264,18 +244,21 @@ async def search_memories(
     k: int = 5,
     fallback_targets: Optional[List[Tuple[str, str]]] = None,
     list_entities_fn=None,
+    allow_auto_extract: bool = False,
 ) -> str:
     """Cross-user memory search (lightning parity) with a dual-recall fallback.
 
     Resolution order:
       1. explicit ``entity_id`` (comma-separated names / QQ / aliases) → resolve each;
-      2. otherwise fast-LLM extract the subjects from context → resolve each;
+      2. (only when ``allow_auto_extract``) fast-LLM extract the subjects from
+         context → resolve each — off by default: it's an extra LLM round-trip
+         and silently falls through to the speaker when it mis-resolves;
       3. otherwise ``fallback_targets`` (the speaking user + group, from
-         ``recall_query.recall_targets``) so a group query still finds the
-         caller's own memories instead of nothing.
+         ``recall_query.recall_targets``) so a query still finds the caller's
+         own memories instead of nothing.
 
-    Multiple entities are searched in parallel, merged (dedup by id, labelled by
-    entity), then summarised by the fast LLM.
+    Multiple entities are searched in parallel and merged (dedup by id, labelled
+    by entity). No second "summarise" LLM call — the agent reads the block.
     """
     query = (query or "").strip()
     if not query or manager is None:
@@ -303,8 +286,16 @@ async def search_memories(
             if looks_like_entity_id(rid):
                 resolved.append((rid, entity_type))
 
-    # 2. auto-extract subjects from conversation context
-    if not resolved and fast_llm is not None and profile_store is not None:
+    # 2. auto-extract subjects from conversation context — OFF by default. This
+    #    is the expensive, fragile path (a fast-LLM call + name resolution); when
+    #    it mis-resolves it silently falls through to the speaker. Gated behind a
+    #    config flag so the default search stays fast and deterministic.
+    if (
+        not resolved
+        and allow_auto_extract
+        and fast_llm is not None
+        and profile_store is not None
+    ):
         hint = ""
         if list_entities_fn is not None:
             hint = await known_users_hint(profile_store, list_entities_fn)
@@ -340,9 +331,7 @@ async def search_memories(
             continue
         parts.extend(_format(res, source_labels.get(eid, ""), multi, seen_ids))
 
-    block = "\n".join(parts)
-    if not block:
-        return ""
-    if multi:
-        block = await _summarize(fast_llm, query, block)
-    return block
+    # Results are already labelled by entity when multi; the main agent LLM
+    # reads them directly. We deliberately do NOT run a second "summarise"
+    # LLM round-trip here — it doubled latency for marginal benefit.
+    return "\n".join(parts)

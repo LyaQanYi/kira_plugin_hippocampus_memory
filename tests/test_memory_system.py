@@ -811,6 +811,15 @@ def test_chunks_to_text_hides_raw_sender_id_but_routes_home():
     )
     assert eid2 == "telegram:222"
 
+    # A non-compliant model may echo back the FULL rendered label "小明(用户A)"
+    # (what it saw) instead of the bare token. Routing must strip the trailing
+    # (token) so the personal fact still lands on the user, not the group.
+    eid3, et3 = mgr._resolve_fact_entity(
+        {"speaker_id": "小明(用户A)", "subject": ""}, "telegram", sender_map,
+        unique, "telegram:115", "group", label_to_sid,
+    )
+    assert (eid3, et3) == ("telegram:111", "user")
+
     # An un-named participant is shown as the bare token, no raw id.
     anon_chunks = [[
         {"role": "user", "sender_id": "333", "content": "潜水中"},
@@ -821,6 +830,70 @@ def test_chunks_to_text_hides_raw_sender_id_but_routes_home():
     anon_text = HippocampusManager._chunks_to_text(anon_chunks, {}, anon_tokens)
     assert anon_text == "用户A: 潜水中"
     assert "333" not in anon_text
+
+
+def test_resolve_source_labels_sanitizes_and_disambiguates():
+    """memory_search source labels: user-controlled display names must not break
+    the result line format, and every source must stay distinguishable."""
+    from plugins.kira_plugin_hippocampus_memory.adapters.entity_search import (
+        _resolve_source_labels,
+    )
+
+    class _P:
+        def __init__(self, name="", nickname="", aliases=None):
+            self.name = name
+            self.nickname = nickname
+            self.aliases = aliases or []
+
+    class _Store:
+        def __init__(self, by_id):
+            self._by_id = by_id
+
+        async def get_profile(self, eid, etype):
+            return self._by_id[eid]
+
+    # A crafted nickname carrying any line/prefix delimiter — brackets, CR/LF,
+    # tab, or the Unicode line separator U+2028 — must be folded so it cannot
+    # forge a source line in the tool result the agent reads.
+    sep = chr(0x2028)  # Unicode LINE SEPARATOR, treated as a break by renderers
+    store = _Store({
+        "telegram:1": _P(name="ev]il\nna" + sep + "me\tx"),
+        "telegram:2": _P(nickname="小红"),
+    })
+    labels = _run(_resolve_source_labels(
+        store, [("telegram:1", "user"), ("telegram:2", "user")]
+    ))
+    forbidden = "][\r\n\t\x0b\x0c" + chr(0x2028) + chr(0x2029)
+    assert not any(c in labels["telegram:1"] for c in forbidden)
+    assert labels["telegram:2"] == "小红"
+
+    # A real display name literally equal to an opaque token ("用户B" == the token
+    # for index 1) must not collide with a nameless source at index 1.
+    store2 = _Store({
+        "telegram:10": _P(name="用户B"),  # == _opaque_label(1)
+        "telegram:11": _P(),             # nameless at index 1 → token 用户B
+    })
+    labels2 = _run(_resolve_source_labels(
+        store2, [("telegram:10", "user"), ("telegram:11", "user")]
+    ))
+    assert labels2["telegram:10"] == "用户B"
+    assert labels2["telegram:11"] != "用户B"      # disambiguated, not a duplicate
+    assert len(set(labels2.values())) == 2        # both sources stay distinct
+
+    # Pathological 3-entity case: the disambiguated fallback must itself stay
+    # distinct. entity0 named "用户C#2", entity1 named "用户C" (occupies the token
+    # _opaque_label(2)), entity2 nameless → token "用户C" is taken, so it must
+    # NOT land back on "用户C#2" (which entity0 already holds).
+    store3 = _Store({
+        "telegram:20": _P(name="用户C#2"),
+        "telegram:21": _P(name="用户C"),   # == _opaque_label(2)
+        "telegram:22": _P(),              # nameless at index 2 → token 用户C
+    })
+    labels3 = _run(_resolve_source_labels(
+        store3,
+        [("telegram:20", "user"), ("telegram:21", "user"), ("telegram:22", "user")],
+    ))
+    assert len(set(labels3.values())) == 3        # no two sources share a label
 
 
 # --------------------------------------------------------------------------
@@ -887,7 +960,7 @@ def test_build_turn_profile_prompt_dm_and_group():
                 "telegram:999", "group", is_group=True,
             )
             assert "【小明】" in anon_grp
-            assert "【用户2】" in anon_grp     # un-named → 用户N, not the id tail
+            assert "【用户B】" in anon_grp     # un-named → opaque token, not id tail
             assert "333" not in anon_grp       # bare id fragment must not leak
             assert "111" not in anon_grp
 

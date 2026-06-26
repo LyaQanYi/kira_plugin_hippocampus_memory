@@ -300,7 +300,9 @@ class HippocampusManager:
                 fact, entity_id, entity_type
             )
         except Exception as e:
-            logger.warning(f"Curated add failed, writing directly: {e}")
+            # Log only the exception type — the message can embed the entity id
+            # or profile path, which this plugin keeps out of logs/prompts.
+            logger.warning(f"Curated add failed, writing directly: {type(e).__name__}")
             await self.add_fact(text, entity_id, entity_type, importance, tags, source)
             return "stored"
 
@@ -689,7 +691,7 @@ class HippocampusManager:
                     # tail — that's the bare platform/QQ number, which the plugin
                     # must keep out of prompts. Use an opaque ordinal so the model
                     # can still tell speakers apart.
-                    label = profile.name or profile.nickname or nick or f"用户{i + 1}"
+                    label = profile.name or profile.nickname or nick or _opaque_label(i)
                     parts.append(f"【{label}】\n{p}")
                 if not parts:
                     return ""
@@ -885,13 +887,29 @@ class HippocampusManager:
         speaker_id = (fact.get("speaker_id", "") or "").strip()
         subject = (fact.get("subject", "") or "").strip()
 
-        tok_sid = label_to_sid.get(speaker_id) or label_to_sid.get(speaker_id.lower())
+        def _token_sid(value: str) -> str:
+            """Resolve a token back to a sender id, tolerating the full rendered
+            label form ``昵称(用户A)`` — the prompt shows the model that composite,
+            so a non-compliant model may echo it back whole instead of the bare
+            token. Strip a trailing ``(token)`` and retry before giving up."""
+            value = (value or "").strip()
+            if not value:
+                return ""
+            sid = label_to_sid.get(value) or label_to_sid.get(value.lower())
+            if sid:
+                return sid
+            if value.endswith(")") and "(" in value:
+                tok = value.rsplit("(", 1)[-1][:-1].strip()
+                return label_to_sid.get(tok) or label_to_sid.get(tok.lower()) or ""
+            return ""
+
+        tok_sid = _token_sid(speaker_id)
         if tok_sid:
             return f"{adapter}:{tok_sid}", ENTITY_USER
         if speaker_id and speaker_id in sender_map:
             return f"{adapter}:{sender_map[speaker_id]}", ENTITY_USER
 
-        sub_sid = label_to_sid.get(subject) or label_to_sid.get(subject.lower())
+        sub_sid = _token_sid(subject)
         if sub_sid:
             return f"{adapter}:{sub_sid}", ENTITY_USER
         if subject and subject.lower() in sender_map:

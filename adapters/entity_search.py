@@ -20,7 +20,7 @@ from typing import List, Optional, Tuple
 from core.logging_manager import get_logger
 
 from .llm import chat_text
-from ..memory.manager import _TYPE_LABELS  # single source of truth for labels
+from ..memory.manager import _TYPE_LABELS, _opaque_label  # single source of truth
 
 logger = get_logger("hippocampus.entity_search", "cyan")
 
@@ -201,7 +201,7 @@ async def _summarize(fast_llm, query: str, merged_text: str) -> str:
         return merged_text
 
 
-def _format(memories, entity_id: str, multi: bool, seen_ids: set) -> List[str]:
+def _format(memories, source_label: str, multi: bool, seen_ids: set) -> List[str]:
     lines = []
     for mem in memories:
         if mem.id in seen_ids:
@@ -209,9 +209,43 @@ def _format(memories, entity_id: str, multi: bool, seen_ids: set) -> List[str]:
         seen_ids.add(mem.id)
         label = _TYPE_LABELS.get(mem.type, mem.type)
         tags = f" [{', '.join(mem.tags)}]" if mem.tags else ""
-        prefix = f"[{entity_id}] " if multi else ""
+        # In multi-entity mode each line is annotated with its source — by a
+        # resolved display name (or an opaque label), NEVER the raw entity_id,
+        # which must not reach the agent LLM via the tool result.
+        prefix = f"[{source_label}] " if multi else ""
         lines.append(f"{prefix}[{label}]{tags} {mem.raw_text}")
     return lines
+
+
+async def _resolve_source_labels(profile_store, resolved) -> dict:
+    """Map each resolved entity_id → a source label for the merged result.
+
+    Prefers the profile's display name (name / nickname / first alias) and falls
+    back to an opaque per-turn label ("用户A", …) so the canonical entity_id is
+    never surfaced in the memory_search tool result. Two entities that resolve
+    to the SAME display name are disambiguated with the opaque token (e.g.
+    "小明(用户B)") so each source stays distinguishable — the raw id is never
+    surfaced either way."""
+    labels: dict = {}
+    used: set = set()
+    for i, (eid, etype) in enumerate(resolved):
+        name = ""
+        if profile_store is not None:
+            try:
+                p = await profile_store.get_profile(eid, etype)
+                name = p.name or p.nickname or (p.aliases[0] if p.aliases else "")
+            except Exception as e:
+                logger.debug(f"source label resolve failed: {type(e).__name__}")
+        token = _opaque_label(i)
+        if not name:
+            label = token
+        elif name in used:
+            label = f"{name}({token})"
+        else:
+            label = name
+        used.add(label)
+        labels[eid] = label
+    return labels
 
 
 # ---------------------------------------------------------------------------
@@ -295,13 +329,16 @@ async def search_memories(
     )
 
     multi = len(resolved) > 1
+    # Resolve a display label per source only when we actually annotate lines
+    # (multi-entity mode) — keeps the single-entity path free of profile reads.
+    source_labels = await _resolve_source_labels(profile_store, resolved) if multi else {}
     seen_ids: set = set()
     parts: List[str] = []
     for (eid, _etype), res in zip(resolved, search_results):
         if isinstance(res, Exception):
             logger.warning(f"Search failed for {eid}: {res}")
             continue
-        parts.extend(_format(res, eid, multi, seen_ids))
+        parts.extend(_format(res, source_labels.get(eid, ""), multi, seen_ids))
 
     block = "\n".join(parts)
     if not block:

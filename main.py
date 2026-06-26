@@ -18,8 +18,12 @@ from core.provider import LLMRequest
 
 from .adapters.llm import append_to_prompt_section
 from .adapters.migration import migrate_simple_memory_if_needed
-from .adapters.recall_query import query_from_event, recall_targets
-from .adapters.entity_search import search_memories
+from .adapters.recall_query import query_from_event, recall_targets, sender_users
+from .adapters.entity_search import (
+    search_memories,
+    looks_like_entity_id,
+    looks_like_group_id,
+)
 from .adapters.sender_cache import SenderCache
 from .memory.manager import HippocampusManager
 from .memory.paths import list_all_entities, set_memory_root
@@ -42,10 +46,11 @@ MEM_TOOL_FEW_SHOT = """
 #### 核心记忆工具
 核心记忆用于记录你**主动认为重要的信息**，包括用户分享的重要信息和你自己的相关信息。
 
-* `memory_add`: 添加一条记忆到核心记忆和长期记忆
-* `memory_update`: 修改特定的核心记忆（通过索引号）
-* `memory_remove`: 删除一条核心记忆
+* `memory_add`: 添加一条记忆到核心记忆和长期记忆（自动去重/合并）
+* `memory_update`: 修改特定的核心记忆（通过索引号；编号无效时会返回当前列表）
+* `memory_remove`: 删除一条核心记忆（通过索引号；编号无效时会返回当前列表）
 * `memory_search`: 主动检索长期记忆（按语义/关键词）
+* `memory_profile`: 查看某个用户/群的画像（名字、曾用名、特征、偏好、已知事实）
 
 #### 使用原则
 * 你需要 **主动调用记忆工具** 记录重要信息
@@ -334,6 +339,22 @@ class HippocampusMemoryPlugin(BasePlugin):
             return session.sid
         return ""
 
+    @staticmethod
+    def _coerce_index(value) -> Optional[int]:
+        """Parse a tool ``index`` arg to an int, REJECTING non-integral values.
+
+        A bare ``int(1.9)`` silently truncates to 1, so memory_update/remove could
+        edit or delete the wrong memory. Returns None on anything non-integral or
+        unparseable so the caller surfaces the numbered list instead of acting on
+        a guessed index."""
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not f.is_integer():
+            return None
+        return int(f)
+
     # ==================================================================
     # Hooks
     # ==================================================================
@@ -400,77 +421,96 @@ class HippocampusMemoryPlugin(BasePlugin):
         while len(self._last_step_hash) > self._STEP_HASH_CAP:
             self._last_step_hash.popitem(last=False)
 
-        # Take the latest user message in cache to pair with this assistant
-        # turn. The sender cache keeps a rolling window keyed by session; we
-        # rely on it (rather than popping) so multi-step agent loops can still
-        # find the originating user text.
-        recents = self._sender_cache.get_recent(sid, max_age_sec=600)
-        user_text = recents[-1]["text"] if recents else ""
-        self._manager.submit_chunk(sid, user_text=user_text, assistant_text=raw_output)
+        # Pair this assistant turn with the EXACT user message(s) recorded since
+        # the previous turn. Each carries its own user_id/nickname (from the
+        # @on.im_batch_message cache), so facts route to the right entity even in
+        # busy multi-speaker group bursts — no matching the reply back to a user
+        # message by text. take_unconsumed advances a per-session watermark, so a
+        # multi-step agent loop consumes the user turn once and later steps feed
+        # only the assistant text.
+        user_msgs = self._sender_cache.take_unconsumed(sid, max_age_sec=600)
+        self._manager.submit_exchange(sid, user_msgs, raw_output)
 
     @on.llm_request(priority=Priority.MEDIUM)
     async def inject_memory(self, event, req: LLMRequest, *_):
-        """Inject recalled memories + tool guidance into the system prompt."""
+        """Inject recalled memories + user profile + tool guidance into the prompt."""
         if self._manager is None:
             return
 
         # Always append the rule/few-shot guidance (simple_memory is disabled).
         append_to_prompt_section(req.system_prompt, "tools", MEM_TOOL_FEW_SHOT)
 
-        if not self.plugin_cfg.get("enable_recall", True):
-            return
-
         sid = self._resolve_session(event)
         if not sid:
             return
-
         try:
             entity_id, entity_type = self._manager._parse_entity_from_session(sid)
         except ValueError:
             return
+        is_group = entity_type == "group"
 
-        # Prefer the clean per-message text from the event over req.user_prompt.
-        # By the time this MEDIUM hook runs, kira-ai's SYS_HIGH hook has spliced
-        # a message envelope ([date] [message_id: ...] [group_name: ... group_id:
-        # ... user_nickname: ..., user_id: ...] | <body>) into req.user_prompt,
-        # whose generic words flood the FTS query and false-match stored facts.
-        # event.messages[*].message_str holds the envelope-free body, filled
-        # before any llm_request hook. Fall back to _extract_query(req) when the
-        # event has no usable message text.
-        query = query_from_event(event) or self._extract_query(req)
-        if not query:
-            return
-
-        k = self._int_cfg("recall_top_k", 5)
-
-        # Dual-path recall (mirrors KiraAI-lightning's message_manager): always
-        # recall the speaking user's own memories, and in a group additionally
-        # recall the group entity, then merge + dedup by id. Without this a group
-        # turn recalled ONLY the group entity, so a user's personal memories
-        # (learned in DM, or routed to their user entity inside the group) never
-        # surfaced — the "cross-session amnesia / often can't recall" users hit.
-        memories: list = []
-        seen_ids: set = set()
-        for tgt_id, tgt_type in recall_targets(event, entity_id, entity_type):
+        # --- Always-on profile context (parity with lightning's per-turn
+        # user_profile injection). In a group this aggregates every participant's
+        # profile; in a DM it's the single user's. Independent of recall — the bot
+        # should know *who it's talking to* even when nothing is recalled and even
+        # when there is no usable recall query (e.g. a sticker-only turn).
+        profile_block = ""
+        if self.plugin_cfg.get("enable_profile_injection", True):
             try:
-                hits = await self._manager.recall(
-                    query=query, entity_id=tgt_id, entity_type=tgt_type, k=k
+                profile_block = await self._manager.build_turn_profile_prompt(
+                    sender_users(event), entity_id, entity_type, is_group
                 )
             except Exception as e:
-                logger.debug(f"Recall failed for {tgt_type}:{tgt_id}: {e}")
-                continue
-            for m in hits:
-                if m.id not in seen_ids:
-                    seen_ids.add(m.id)
-                    memories.append(m)
+                logger.debug(f"Profile injection skipped: {e}")
+            # Only truncate on a positive cap; a 0/negative value (bad WebUI
+            # input) means "don't truncate" rather than a broken negative slice.
+            max_profile = self._int_cfg("max_profile_chars", 800)
+            if profile_block and max_profile > 0 and len(profile_block) > max_profile:
+                profile_block = profile_block[:max_profile] + "\n…(truncated)"
 
-        block = self._manager.format_recalled_memories(memories)
+        # --- Recalled memories (RAG).
+        block = ""
+        if self.plugin_cfg.get("enable_recall", True):
+            # Prefer the clean per-message text from the event over req.user_prompt.
+            # By the time this MEDIUM hook runs, kira-ai's SYS_HIGH hook has spliced
+            # a message envelope ([date] [message_id: ...] [group_name: ...
+            # group_id: ... user_nickname: ..., user_id: ...] | <body>) into
+            # req.user_prompt, whose generic words flood the FTS query and
+            # false-match stored facts. event.messages[*].message_str holds the
+            # envelope-free body, filled before any llm_request hook. Fall back to
+            # _extract_query(req) when the event has no usable message text.
+            query = query_from_event(event) or self._extract_query(req)
+            if query:
+                k = self._int_cfg("recall_top_k", 5)
+                # Dual-path recall (mirrors lightning's message_manager): always
+                # recall the speaking user's own memories, and in a group
+                # additionally the group entity, then merge + dedup by id. Without
+                # this a group turn recalled ONLY the group entity, so a user's
+                # personal memories never surfaced — the "cross-session amnesia"
+                # users hit.
+                memories: list = []
+                seen_ids: set = set()
+                for tgt_id, tgt_type in recall_targets(event, entity_id, entity_type):
+                    try:
+                        hits = await self._manager.recall(
+                            query=query, entity_id=tgt_id, entity_type=tgt_type, k=k
+                        )
+                    except Exception as e:
+                        logger.debug(f"Recall failed for {tgt_type}:{tgt_id}: {e}")
+                        continue
+                    for m in hits:
+                        if m.id not in seen_ids:
+                            seen_ids.add(m.id)
+                            memories.append(m)
 
-        max_chars = self._int_cfg("max_recall_chars", 1500)
-        if len(block) > max_chars:
-            block = block[:max_chars] + "\n…(truncated)"
+                block = self._manager.format_recalled_memories(memories)
+                max_chars = self._int_cfg("max_recall_chars", 1500)
+                if len(block) > max_chars:
+                    block = block[:max_chars] + "\n…(truncated)"
 
         addition_parts: list[str] = []
+        if profile_block:
+            addition_parts.append("\n## 用户画像\n" + profile_block)
         if block:
             addition_parts.append("\n## 长期记忆召回\n" + block)
         addition_parts.append("\n" + MEM_RULE_PROMPT)
@@ -512,7 +552,10 @@ class HippocampusMemoryPlugin(BasePlugin):
             except ValueError:
                 pass
 
-        await self._manager.add_fact(
+        # Route through the dedup/merge pipeline (like the background hippocampus)
+        # so a manual add can't create a duplicate the extractor would collapse,
+        # and can merge into an existing memory instead.
+        decision = await self._manager.add_fact_curated(
             text=text,
             entity_id=entity_id,
             entity_type=entity_type,
@@ -520,7 +563,13 @@ class HippocampusMemoryPlugin(BasePlugin):
             tags=["explicit"],
             source={"session": sid, "origin": "memory_add"},
         )
-        return "Core memory added"
+        return {
+            "duplicate": "已存在相同记忆，无需重复记录",
+            "update": "已合并进已有记忆",
+            "new": "已写入长期记忆",
+            "stored": "已写入长期记忆",
+            "skip": "Empty memory text",
+        }.get(decision, "已写入长期记忆")
 
     @register.tool(
         name="memory_update",
@@ -529,7 +578,7 @@ class HippocampusMemoryPlugin(BasePlugin):
             "type": "object",
             "properties": {
                 "index": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "要修改的记忆编号",
                 },
                 "text": {
@@ -546,10 +595,20 @@ class HippocampusMemoryPlugin(BasePlugin):
         sid = self._resolve_session(event) if event is not None else ""
         if not sid:
             return "Cannot resolve session"
-        mem = await self._manager.update_fact_by_index(sid, int(index), text)
-        if mem is None:
-            return "Index out of range"
-        return "Core memory updated"
+        text = (text or "").strip()
+        if not text:
+            return "Empty memory text"
+        idx = self._coerce_index(index)
+        mems = await self._manager.list_editable_memories(sid)
+        if idx is None or idx < 0 or idx >= len(mems):
+            listing = self._manager.format_editable_list(mems)
+            return (
+                f"编号 {index} 无效或超出范围。当前可编辑记忆：\n{listing}"
+                if listing
+                else "当前没有可修改的记忆"
+            )
+        mem = await self._manager.update_memory_at(mems, idx, text)
+        return "Core memory updated" if mem is not None else "Update failed"
 
     @register.tool(
         name="memory_remove",
@@ -558,7 +617,7 @@ class HippocampusMemoryPlugin(BasePlugin):
             "type": "object",
             "properties": {
                 "index": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "要删除的记忆编号",
                 },
             },
@@ -571,10 +630,17 @@ class HippocampusMemoryPlugin(BasePlugin):
         sid = self._resolve_session(event) if event is not None else ""
         if not sid:
             return "Cannot resolve session"
-        ok = await self._manager.delete_fact_by_index(sid, int(index))
-        if not ok:
-            return "Index out of range"
-        return "Core memory removed"
+        idx = self._coerce_index(index)
+        mems = await self._manager.list_editable_memories(sid)
+        if idx is None or idx < 0 or idx >= len(mems):
+            listing = self._manager.format_editable_list(mems)
+            return (
+                f"编号 {index} 无效或超出范围。当前可删除记忆：\n{listing}"
+                if listing
+                else "当前没有可删除的记忆"
+            )
+        ok = await self._manager.delete_memory_at(mems, idx)
+        return "Core memory removed" if ok else "Remove failed"
 
     @register.tool(
         name="memory_search",
@@ -650,6 +716,73 @@ class HippocampusMemoryPlugin(BasePlugin):
             list_entities_fn=list_all_entities,
         )
         return block or "暂无相关长期记忆"
+
+    @register.tool(
+        name="memory_profile",
+        description=(
+            "查看某个用户/群的画像（名字、昵称、曾用名、特征、偏好、已知事实）。"
+            "entity_id 可传昵称、曾用名或 QQ 号，系统自动匹配；省略时查看当前对话对象。"
+        ),
+        params={
+            "type": "object",
+            "properties": {
+                "entity_id": {
+                    "type": "string",
+                    "description": "目标：昵称/曾用名/QQ号；留空 = 当前对话对象",
+                },
+                "entity_type": {
+                    "type": "string",
+                    "description": "实体类型（默认 user）",
+                    "enum": ["user", "group", "channel"],
+                },
+            },
+            "required": [],
+        },
+    )
+    async def memory_profile(
+        self, event, *_, entity_id: str = "", entity_type: str = "user"
+    ) -> str:
+        if self._manager is None:
+            return "Memory plugin not initialized"
+        entity_id = (entity_id or "").strip()
+        etype = entity_type or "user"
+
+        resolved = ""
+        if entity_id:
+            if looks_like_entity_id(entity_id):
+                resolved = entity_id
+                # A canonical id carries no reliable type marker. If it's
+                # obviously group-like ("group"/"群"), prefer the group profile so
+                # a group id passed with the default entity_type=user isn't read
+                # as a non-existent user profile. (Numeric group ids are
+                # indistinguishable from user ids — the caller must set
+                # entity_type for those.)
+                if looks_like_group_id(entity_id):
+                    etype = "group"
+            else:
+                # Resolve a nickname / alias / QQ number to a canonical id.
+                try:
+                    resolved = await self._manager.profile_store.resolve_entity_by_name(
+                        entity_id, etype
+                    ) or ""
+                except Exception:
+                    resolved = ""
+                if not resolved:
+                    return f"找不到名为「{entity_id}」的{etype}"
+
+        # No (or unresolved-but-empty) target → current conversation entity.
+        if not resolved:
+            sid = self._resolve_session(event) if event is not None else ""
+            if sid:
+                try:
+                    resolved, etype = self._manager._parse_entity_from_session(sid)
+                except ValueError:
+                    resolved = ""
+        if not resolved:
+            return "无法确定要查看的对象"
+
+        prompt = await self._manager.get_profile_prompt(resolved, etype)
+        return prompt or "暂无画像信息"
 
     # ==================================================================
     # HTTP APIs (debug / WebUI)

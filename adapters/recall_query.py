@@ -30,6 +30,42 @@ def query_from_event(event: Any) -> str:
     ).strip()
 
 
+def sender_users(event):
+    """Distinct ``[(entity_id, nickname)]`` for the users who spoke in this batch.
+
+    ``entity_id`` is ``f"{adapter}:{user_id}"``. Order-preserving, mirroring
+    KiraAI-lightning's ``seen_senders`` set built from ``event.messages`` — used to
+    inject the always-on user/group profile context into the live turn (the
+    biggest end-to-end gap vs lightning, which passes ``user_profile=`` into
+    ``get_agent_prompt`` every turn).
+
+    Pure (no ``core.*`` import) so it stays unit-testable. ``event`` is
+    duck-typed: ``.adapter.name`` and ``.messages[*].sender.{user_id, nickname}``.
+    """
+    adapter = ""
+    adapter_obj = getattr(event, "adapter", None)
+    if adapter_obj is not None:
+        adapter = getattr(adapter_obj, "name", "") or ""
+
+    out: list = []
+    seen: set = set()
+    messages = getattr(event, "messages", None) or []
+    for msg in messages:
+        sender = getattr(msg, "sender", None)
+        if sender is None:
+            continue
+        uid = getattr(sender, "user_id", "") or ""
+        if not uid or not adapter:
+            continue
+        eid = f"{adapter}:{uid}"
+        if eid in seen:
+            continue
+        seen.add(eid)
+        nick = getattr(sender, "nickname", "") or ""
+        out.append((eid, nick))
+    return out
+
+
 def recall_targets(event, session_entity_id, session_entity_type):
     """Decide which ``(entity_id, entity_type)`` scopes to recall for a turn.
 

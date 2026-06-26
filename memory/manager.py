@@ -239,43 +239,113 @@ class HippocampusManager:
             folder="",
         )
 
-    async def list_facts_for_session(
+    async def add_fact_curated(
+        self,
+        text: str,
+        entity_id: str = "",
+        entity_type: str = "user",
+        importance: int = 7,
+        tags: Optional[list] = None,
+        source: Optional[dict] = None,
+    ) -> str:
+        """Manual add that runs through the hippocampus dedup/merge pipeline.
+
+        Mirrors KiraAI-lightning's MemoryAddTool: an entity-scoped add goes
+        through SHA-256 + FTS5 (+ LLM) dedup so a manual add can't create a
+        duplicate the background extractor would have collapsed — and can MERGE
+        into an existing memory. Exact-hash dedup works even with no LLM
+        configured (the conflict-check just degrades to "new").
+
+        Falls back to a direct write when there's no entity scope (global facts,
+        which the dedup path doesn't cover) or no extractor.
+
+        Returns "duplicate" | "update" | "new" | "stored" | "skip".
+        """
+        text = (text or "").strip()
+        if not text:
+            return "skip"
+        tags = tags or ["explicit"]
+
+        if not entity_id or self.extractor is None:
+            await self.add_fact(text, entity_id, entity_type, importance, tags, source)
+            return "stored"
+
+        fact = {
+            "content": text,
+            "subject": "",
+            "speaker_id": "",
+            "importance": importance,
+            "tags": tags,
+            "semantic_id": "",
+        }
+        try:
+            return await self.extractor.deduplicate_and_store(
+                fact, entity_id, entity_type
+            )
+        except Exception as e:
+            logger.warning(f"Curated add failed, writing directly: {e}")
+            await self.add_fact(text, entity_id, entity_type, importance, tags, source)
+            return "stored"
+
+    async def list_editable_memories(
         self, session: str, k: int = 50
     ) -> List[Memory]:
-        """List facts for the entity inferred from a session id.
+        """Facts AND reflections for the session entity, newest first.
 
-        Used by memory_update / memory_remove tools to resolve `index` → memory.
+        The editable set surfaced to memory_update / memory_remove. Lightning's
+        edit tools were memory_id + entity-resolved across folders; this broadens
+        the plugin's previously facts-only, single-folder view to include elevated
+        reflections so the model can also correct a wrong insight.
         """
         try:
             entity_id, entity_type = self._parse_entity_from_session(session)
         except ValueError:
             return []
-        try:
-            return await self.tree_store.get_all_memories(
-                entity_id=entity_id,
-                entity_type=entity_type,
-                folder="facts",
-            )
-        except Exception as e:
-            logger.warning(f"list_facts_for_session failed for {session}: {e}")
-            return []
+        out: List[Memory] = []
+        for folder in ("facts", "reflections"):
+            try:
+                out.extend(
+                    await self.tree_store.get_all_memories(
+                        entity_id=entity_id,
+                        entity_type=entity_type,
+                        folder=folder,
+                    )
+                )
+            except Exception as e:
+                logger.debug(f"list_editable_memories {folder} failed: {e}")
+        out.sort(key=lambda m: m.last_accessed, reverse=True)
+        return out[:k]
 
-    async def update_fact_by_index(
-        self, session: str, index: int, text: str
+    @staticmethod
+    def format_editable_list(memories: List[Memory]) -> str:
+        """Numbered listing for the memory_update / memory_remove `index` arg."""
+        lines = []
+        for i, m in enumerate(memories):
+            label = _TYPE_LABELS.get(m.type, m.type)
+            lines.append(f"{i}. [{label}] {m.raw_text}")
+        return "\n".join(lines)
+
+    async def update_memory_at(
+        self, memories: List[Memory], index: int, text: str
     ) -> Optional[Memory]:
-        facts = await self.list_facts_for_session(session)
-        if index < 0 or index >= len(facts):
+        if index < 0 or index >= len(memories):
             return None
-        mem = facts[index]
+        # Refuse to blank an existing memory: a single bad model call passing an
+        # empty string must not wipe stored content.
+        text = (text or "").strip()
+        if not text:
+            return None
+        mem = memories[index]
         mem.text = text
         ok = await self.tree_store.update_memory(mem)
         return mem if ok else None
 
-    async def delete_fact_by_index(self, session: str, index: int) -> bool:
-        facts = await self.list_facts_for_session(session)
-        if index < 0 or index >= len(facts):
+    async def delete_memory_at(
+        self, memories: List[Memory], index: int
+    ) -> bool:
+        if index < 0 or index >= len(memories):
             return False
-        mem = facts[index]
+        mem = memories[index]
         return await self.tree_store.delete_memory(
             mem.id,
             entity_id=mem._entity_id,
@@ -287,6 +357,46 @@ class HippocampusManager:
     # ==================================================================
     # Hippocampus (slow loop)
     # ==================================================================
+
+    def submit_exchange(
+        self, session: str, user_msgs: list, assistant_text: str
+    ) -> None:
+        """Feed a completed turn to the hippocampus with EXACT sender identity.
+
+        ``user_msgs`` is a list of SenderCache records
+        (``{user_id, nickname, text, ...}``) — typically every user message
+        recorded since the previous turn (``SenderCache.take_unconsumed``). Each
+        keeps its precise ``sender_id``/``sender_name``, so fact routing no longer
+        depends on matching the assistant turn back to a user message by text,
+        which mis-routed facts under duplicate text or racy multi-speaker bursts.
+
+        Preferred over ``submit_chunk`` for the live @on.step_result path; the
+        single-user ``submit_chunk`` remains for callers that only have a text.
+        """
+        if not session or not (user_msgs or assistant_text):
+            return
+        if self.extractor is None or self.extractor._llm_client is None:
+            return
+
+        chunk: list[dict] = []
+        for um in user_msgs or []:
+            text = (um.get("text") or "").strip()
+            if not text:
+                continue
+            msg = {"role": "user", "content": text}
+            uid = um.get("user_id", "")
+            nick = um.get("nickname", "")
+            if uid:
+                msg["sender_id"] = uid
+            if nick:
+                msg["sender_name"] = nick
+            chunk.append(msg)
+        if assistant_text:
+            chunk.append({"role": "assistant", "content": assistant_text})
+
+        if not chunk:
+            return
+        self._buffer_for_hippocampus(session, chunk)
 
     def submit_chunk(self, session: str, user_text: str, assistant_text: str) -> None:
         """Feed an (user, assistant) exchange to the hippocampus buffer.
@@ -510,6 +620,71 @@ class HippocampusManager:
         self, entity_id: str, entity_type: str = ENTITY_USER
     ) -> str:
         return await self.profile_store.get_profile_prompt(entity_id, entity_type)
+
+    async def build_turn_profile_prompt(
+        self,
+        sender_entities: list,
+        session_entity_id: str,
+        session_entity_type: str,
+        is_group: bool,
+    ) -> str:
+        """Always-on profile context for a single turn (parity with lightning).
+
+        KiraAI-lightning's ``message_manager`` passes ``user_profile=`` into the
+        agent prompt every turn:
+          - in a group with >1 distinct speakers → aggregate **every** speaker's
+            profile, each labelled by display name (never the raw entity_id);
+          - otherwise → the single speaker's profile (in a DM that's the session
+            entity itself).
+
+        ``sender_entities`` is ``[(entity_id, nickname), ...]`` (from
+        ``recall_query.sender_users``). Returns ``""`` when there is no usable
+        profile text, so the caller injects nothing rather than a placeholder.
+        """
+        try:
+            distinct: list = []
+            seen: set = set()
+            for eid, nick in sender_entities or []:
+                if eid and eid not in seen:
+                    seen.add(eid)
+                    distinct.append((eid, nick))
+
+            if is_group and len(distinct) > 1:
+                parts: list = []
+                for i, (eid, nick) in enumerate(distinct):
+                    try:
+                        profile = await self.get_profile(eid, ENTITY_USER)
+                    except Exception:
+                        continue
+                    p = profile.to_prompt()
+                    if not p or p == "暂无画像信息":
+                        continue
+                    # Label by display name only. Never fall back to the raw id
+                    # tail — that's the bare platform/QQ number, which the plugin
+                    # must keep out of prompts. Use an opaque ordinal so the model
+                    # can still tell speakers apart.
+                    label = profile.name or profile.nickname or nick or f"用户{i + 1}"
+                    parts.append(f"【{label}】\n{p}")
+                if not parts:
+                    return ""
+                return (
+                    "以下是本次群聊中参与对话的用户的画像信息，"
+                    "帮助你了解每个人的背景和偏好：\n\n" + "\n\n".join(parts)
+                )
+
+            # Single speaker (or DM): the speaker's profile, falling back to the
+            # session entity when the speaker can't be resolved.
+            if distinct:
+                target_id, target_type = distinct[0][0], ENTITY_USER
+            else:
+                target_id, target_type = session_entity_id, session_entity_type
+            prompt = await self.get_profile_prompt(target_id, target_type)
+            if not prompt or prompt == "暂无画像信息":
+                return ""
+            return prompt
+        except Exception as e:
+            logger.debug(f"build_turn_profile_prompt failed: {type(e).__name__}")
+            return ""
 
     async def update_user_interaction(
         self, user_id: str, platform: str = "", nickname: str = ""

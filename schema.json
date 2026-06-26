@@ -35,6 +35,30 @@
             }
         }
     },
+    "enable_profile_injection": {
+        "type": "switch",
+        "name": "Enable profile injection",
+        "default": true,
+        "hint": "Inject the speaking user's (or group participants') profile into the 'memory' system prompt section every turn, alongside recalled memories. Mirrors KiraAI-lightning's always-on user_profile context.",
+        "locales": {
+            "zh": {
+                "name": "启用画像注入",
+                "hint": "每轮把发言用户（群聊则为所有参与者）的画像随召回结果一起注入 memory 段，复刻 lightning 的常驻用户画像上下文"
+            }
+        }
+    },
+    "max_profile_chars": {
+        "type": "integer",
+        "name": "Max profile block chars",
+        "default": 800,
+        "hint": "Truncate the injected profile block to N chars.",
+        "locales": {
+            "zh": {
+                "name": "画像文本最大长度",
+                "hint": "注入到 prompt 前截断的画像字符数"
+            }
+        }
+    },
     "hippocampus_chunk_threshold": {
         "type": "integer",
         "name": "Hippocampus trigger (chunks)",

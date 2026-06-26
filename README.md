@@ -16,7 +16,9 @@ recall) with a production-grade memory system:
 - **Dimensional reflection**: when an entity accumulates ≥ N facts, the system
   generates higher-level "reflections" (e.g., "tech-oriented") and archives
   the absorbed low-importance facts.
-- **Entity profiles** for `user` / `group` / `channel`, with alias tracking.
+- **Entity profiles** for `user` / `group` / `channel`, with alias tracking,
+  injected into the prompt every turn (in a group, all participants') so the bot
+  always knows *who it's talking to* — not just what it recalled.
 - **Decay-forgetting**: dynamic retention scoring with archive on low scores.
 - **Three-tier persona evolution** (Tier 1 self-awareness → Tier 2 reflections
   → Tier 3 persona, last leap off by default).
@@ -91,8 +93,11 @@ See WebUI → Plugin Manager → Hippocampus Memory for the full list, or
 
 Key switches:
 
-- `enable_recall`: turn off prompt injection if you only want background
-  extraction.
+- `enable_recall`: turn off recalled-memory prompt injection if you only want
+  background extraction.
+- `enable_profile_injection`: inject the speaking user's (or, in a group, every
+  participant's) profile into the prompt each turn, alongside recall. On by
+  default; `max_profile_chars` caps the injected block.
 - `auto_disable_simple_memory` / `migrate_simple_memory_on_first_run`: control
   the takeover behavior.
 - `enable_persona_evolution`: opt in to Tier-3 persona leap (destructive).
@@ -127,6 +132,12 @@ All four stages are implemented and the test suite passes.
 - **Stage C**: decay engine, entity profiles, persona evolution.
 - **Stage D**: docs polish, full test suite ported from
   `test_memory_system.py`.
+- **Stage E** (integration parity with `KiraAI-lightning`): always-on profile
+  injection into the live turn; exact per-message sender identity for the
+  post-turn hippocampus feed (monotonic-watermark `SenderCache`, no text-match
+  guessing); `memory_add` routed through the dedup/merge pipeline;
+  `memory_update`/`memory_remove` span facts + reflections; read-only
+  `memory_profile` tool.
 
 ## Testing
 
@@ -134,10 +145,13 @@ All four stages are implemented and the test suite passes.
 PYTHONPATH=. pytest data/plugins/kira_plugin_hippocampus_memory/tests/ -v
 ```
 
-Eight tests cover: path management, directory structure, TOML CRUD, SHA-256
-dedup, entity profile + alias archiving, the recall pipeline, the decay engine,
-and recall-query envelope sanitization. Tests run with a Python that has
-`pytest` + `jieba` + `tomli_w` installed (the repo's runtime `venv` may not
+The suite (23 tests) covers: path management, directory structure, TOML CRUD,
+SHA-256 dedup, entity profile + alias archiving, the recall pipeline, the decay
+engine, recall-query envelope sanitization, persona-perspective extraction, and
+the Stage-E integration fixes (per-turn profile injection, the monotonic
+sender-cache watermark, exact-identity `submit_exchange`, curated `memory_add`
+dedup, and the facts+reflections editable listing). Tests run with a Python that
+has `pytest` + `jieba` + `tomli_w` installed (the repo's runtime `venv` may not
 include `pytest`).
 
 ## Credits

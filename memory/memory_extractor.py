@@ -442,11 +442,15 @@ class MemoryExtractor:
         fact: dict,
         entity_id: str,
         entity_type: str = "user",
-    ):
+    ) -> str:
         """铁律 #1 完整实现：去重 → 合并/新增
 
         Args:
             fact: {"content": "...", "importance": 7, "tags": [...], "semantic_id": "..."}
+
+        Returns:
+            决策结果 "skip" | "duplicate" | "update" | "new"，供调用方（如手动
+            memory_add 工具）反馈给用户/模型。后台海马体流程忽略此返回值。
         """
         content = fact.get("content", "")
         importance = fact.get("importance", 5)
@@ -454,7 +458,7 @@ class MemoryExtractor:
         semantic_id = fact.get("semantic_id", "")
 
         if not content:
-            return
+            return "skip"
 
         decision, matched = await self.deduplicate(
             content, entity_id, entity_type, "facts"
@@ -462,7 +466,7 @@ class MemoryExtractor:
 
         if decision == "duplicate":
             logger.debug(f"Duplicate memory skipped: {content[:50]}...")
-            return
+            return "duplicate"
 
         if decision == "update" and matched:
             # 合并后更新旧记忆
@@ -480,7 +484,7 @@ class MemoryExtractor:
                 logger.info(f"Memory merged: id={matched.id}")
             else:
                 logger.warning(f"Failed to merge memory {matched.id}")
-            return
+            return "update"
 
         # 全新事实 → 写入
         # 尝试获取语义 ID
@@ -498,6 +502,7 @@ class MemoryExtractor:
             folder="facts",
         )
         logger.info(f"New fact stored for {entity_type}:{entity_id}")
+        return "new"
 
     # ==========================================
     # 信息升维（宪章铁律 #2）

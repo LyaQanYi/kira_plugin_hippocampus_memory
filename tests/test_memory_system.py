@@ -714,3 +714,255 @@ def test_build_sender_profiles_context():
             await mgr.close()
 
     _run(run())
+
+
+# --------------------------------------------------------------------------
+# Fix #1: always-on profile injection into the live turn (parity with
+# lightning's per-turn user_profile). build_turn_profile_prompt aggregates in
+# groups and uses the single speaker (or session entity) otherwise.
+# --------------------------------------------------------------------------
+
+def test_sender_users_extracts_distinct_speakers():
+    from plugins.kira_plugin_hippocampus_memory.adapters.recall_query import (
+        sender_users,
+    )
+
+    event = _FakeRoutedEvent("telegram", [
+        _FakeSenderMsg("hi", "111"),
+        _FakeSenderMsg("yo", "222"),
+        _FakeSenderMsg("again", "111"),   # duplicate speaker collapses
+        _FakeSenderMsg("anon", ""),       # no user_id → skipped
+    ])
+    assert sender_users(event) == [("telegram:111", ""), ("telegram:222", "")]
+    # No adapter / no messages → empty.
+    assert sender_users(object()) == []
+    assert sender_users(_FakeRoutedEvent("telegram", [])) == []
+
+
+def test_build_turn_profile_prompt_dm_and_group():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+
+            await mgr.profile_store.update_profile("telegram:111", name="小明")
+            await mgr.profile_store.update_profile("telegram:222", name="小红")
+
+            # DM / single speaker → that user's profile, no aggregate header.
+            dm = await mgr.build_turn_profile_prompt(
+                [("telegram:111", "小明")], "telegram:111", "user", is_group=False
+            )
+            assert "名字: 小明" in dm
+            assert "参与对话的用户" not in dm
+
+            # Group with >1 speakers → aggregated, each labelled by display name.
+            grp = await mgr.build_turn_profile_prompt(
+                [("telegram:111", "小明"), ("telegram:222", "小红")],
+                "telegram:999", "group", is_group=True,
+            )
+            assert "本次群聊中参与对话的用户" in grp
+            assert "【小明】" in grp and "【小红】" in grp
+            assert "名字: 小明" in grp and "名字: 小红" in grp
+            # System entity_id must never leak into the prompt.
+            assert "telegram:111" not in grp
+
+            # Group with an un-named participant → opaque ordinal label, never
+            # the bare id tail (a QQ/platform number the plugin must not leak).
+            await mgr.profile_store.add_trait("telegram:333", "潜水")  # trait, no name
+            anon_grp = await mgr.build_turn_profile_prompt(
+                [("telegram:111", "小明"), ("telegram:333", "")],
+                "telegram:999", "group", is_group=True,
+            )
+            assert "【小明】" in anon_grp
+            assert "【用户2】" in anon_grp     # un-named → 用户N, not the id tail
+            assert "333" not in anon_grp       # bare id fragment must not leak
+            assert "111" not in anon_grp
+
+            # No usable profile (unknown user) → empty string, inject nothing.
+            empty = await mgr.build_turn_profile_prompt(
+                [("telegram:404", "幽灵")], "telegram:404", "user", is_group=False
+            )
+            assert empty == ""
+
+            await mgr.close()
+
+    _run(run())
+
+
+# --------------------------------------------------------------------------
+# Fix #2: exact sender identity for post-turn extraction. take_unconsumed
+# uses a monotonic watermark; submit_exchange carries precise sender_id/name.
+# --------------------------------------------------------------------------
+
+def test_sender_cache_take_unconsumed_watermark():
+    c = SenderCache()
+    sid = "telegram:gm:1"
+    c.record(sid, "111", "小明", "a")
+    c.record(sid, "222", "小红", "b")
+
+    first = c.take_unconsumed(sid)
+    assert [x["text"] for x in first] == ["a", "b"]
+    assert [x["user_id"] for x in first] == ["111", "222"]
+
+    # Nothing new since the watermark advanced.
+    assert c.take_unconsumed(sid) == []
+
+    c.record(sid, "111", "小明", "c")
+    second = c.take_unconsumed(sid)
+    assert [x["text"] for x in second] == ["c"]
+
+    # take_unconsumed does NOT delete — the full window is still visible.
+    assert len(c.get_recent(sid, max_age_sec=9999)) == 3
+
+
+def test_sender_cache_bounds_sessions():
+    """_data and _consumed_seq must not grow without bound across sessions."""
+    c = SenderCache(max_sessions=3)
+    for i in range(5):
+        c.record(f"sid{i}", str(i), f"u{i}", "hi")
+        c.take_unconsumed(f"sid{i}")   # also populates _consumed_seq[sid{i}]
+
+    assert len(c._data) == 3            # oldest evicted FIFO
+    assert len(c._consumed_seq) <= 3   # watermark map pruned in lockstep
+    assert "sid0" not in c._data and "sid1" not in c._data
+    assert "sid0" not in c._consumed_seq and "sid1" not in c._consumed_seq
+    assert "sid4" in c._data
+
+
+def test_submit_exchange_carries_exact_identity():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,   # never auto-flush; inspect buffer
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+            mgr.set_clients(llm_client=FakeLLM([]))   # non-None so submit proceeds
+
+            sid = "telegram:gm:999"
+            user_msgs = [
+                {"user_id": "111", "nickname": "小明", "text": "我喜欢 Python"},
+                {"user_id": "222", "nickname": "小红", "text": "我用 JavaScript"},
+            ]
+            mgr.submit_exchange(sid, user_msgs, "了解了")
+
+            buffered = mgr._pending_conversations.get(sid, [])
+            assert len(buffered) == 1
+            chunk = buffered[0]
+            users = [m for m in chunk if m["role"] == "user"]
+            # Every user message keeps its precise sender_id/sender_name — no
+            # reconstruction by text match.
+            assert {m["sender_id"] for m in users} == {"111", "222"}
+            assert {m.get("sender_name") for m in users} == {"小明", "小红"}
+            assert chunk[-1] == {"role": "assistant", "content": "了解了"}
+
+            # The sender map derives id + nickname keys straight from the chunk.
+            smap = mgr._build_sender_map(sid, [chunk])
+            assert smap.get("111") == "111"
+            assert smap.get("小明") == "111"
+
+            await mgr.close()
+
+    _run(run())
+
+
+# --------------------------------------------------------------------------
+# Fix #3: manual memory_add runs through dedup/merge; update/remove span
+# facts + reflections with a numbered listing on an out-of-range index.
+# --------------------------------------------------------------------------
+
+def test_add_fact_curated_dedups_exact_duplicate():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+            # No LLM needed: exact-hash dedup is LLM-free; the conflict check
+            # degrades to "new" without one. fast LLM returns "" semantic ids.
+            mgr.set_clients(llm_client=FakeLLM([""] * 8), fast_llm_client=FakeLLM([""] * 8))
+
+            d1 = await mgr.add_fact_curated(
+                "用户喜欢喝美式咖啡", entity_id="telegram:111", entity_type="user"
+            )
+            assert d1 == "new"
+
+            d2 = await mgr.add_fact_curated(
+                "用户喜欢喝美式咖啡", entity_id="telegram:111", entity_type="user"
+            )
+            assert d2 == "duplicate"          # exact-hash dedup caught it
+
+            facts = await mgr.tree_store.get_all_memories(
+                entity_id="telegram:111", entity_type="user", folder="facts"
+            )
+            assert len(facts) == 1            # NOT duplicated on disk
+
+            # No entity scope → direct global write ("stored"), not dedup path.
+            d3 = await mgr.add_fact_curated("世界是圆的", entity_id="")
+            assert d3 == "stored"
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_list_editable_memories_spans_facts_and_reflections():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+            mgr.set_clients(llm_client=FakeLLM([]))
+
+            await mgr.tree_store.add_memory(
+                content_text="喜欢 Python", memory_type="fact", importance=6,
+                entity_id="telegram:111", entity_type="user", folder="facts",
+            )
+            await mgr.tree_store.add_memory(
+                content_text="技术导向的人", memory_type="reflection", importance=7,
+                entity_id="telegram:111", entity_type="user", folder="reflections",
+            )
+
+            sid = "telegram:dm:111"
+            mems = await mgr.list_editable_memories(sid)
+            texts = {m.raw_text for m in mems}
+            assert "喜欢 Python" in texts        # fact included
+            assert "技术导向的人" in texts        # reflection included too
+
+            listing = mgr.format_editable_list(mems)
+            assert listing.startswith("0. ")
+            assert "1. " in listing
+
+            # Empty/whitespace update is refused — a bad call must not blank a memory.
+            assert await mgr.update_memory_at(mems, 0, "   ") is None
+            assert await mgr.update_memory_at(mems, 0, "") is None
+            # A real update still works.
+            updated = await mgr.update_memory_at(mems, 0, "改成新内容")
+            assert updated is not None and updated.raw_text == "改成新内容"
+
+            # Remove by index actually deletes.
+            ok = await mgr.delete_memory_at(mems, 0)
+            assert ok is True
+            remaining = await mgr.list_editable_memories(sid)
+            assert len(remaining) == 1
+
+            await mgr.close()
+
+    _run(run())

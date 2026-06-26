@@ -48,6 +48,23 @@ _TYPE_LABELS = {
 }
 
 
+def _opaque_label(index: int) -> str:
+    """Opaque, per-turn participant label ("用户A", "用户B", … "用户Z", "用户AA").
+
+    Used wherever a raw platform/canonical id would otherwise be shown to an
+    LLM (or returned by a tool): the model can still tell participants apart,
+    but the real identifier never reaches the prompt. Bijective base-26 so the
+    labels stay distinct for arbitrarily many participants."""
+    n = index
+    letters = ""
+    while True:
+        letters = chr(ord("A") + n % 26) + letters
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return f"用户{letters}"
+
+
 def _as_int(value, default: int) -> int:
     """Coerce a config value to int, tolerating None / blank / non-numeric."""
     if value is None or value == "":
@@ -499,12 +516,21 @@ class HippocampusManager:
             adapter = session.split(":", maxsplit=1)[0]
             is_group = session_entity_type == ENTITY_GROUP
 
-            conversation_text = self._chunks_to_text(chunks, sender_map)
+            # Assign every distinct sender an opaque per-turn token ("用户A", …)
+            # so the raw platform id never reaches the extraction prompt; the
+            # inverse map routes extracted facts back to the real sender.
+            token_by_sid = self._participant_tokens(unique_senders)
+            label_to_sid: dict[str, str] = {}
+            for sid, tok in token_by_sid.items():
+                label_to_sid[tok] = sid
+                label_to_sid[tok.lower()] = sid
+
+            conversation_text = self._chunks_to_text(chunks, sender_map, token_by_sid)
 
             # 构建 sender profile 上下文，辅助 LLM 更准确地提取和路由事实，
             # 避免重复记录已知信息（精确复刻 lightning memory_manager 的提取增强）。
             profile_context = await self._build_sender_profiles_context(
-                adapter, unique_senders
+                adapter, unique_senders, token_by_sid
             )
             if profile_context:
                 conversation_text = f"{profile_context}\n\n{conversation_text}"
@@ -530,7 +556,7 @@ class HippocampusManager:
             for fact in personal_facts:
                 eid, etype = self._resolve_fact_entity(
                     fact, adapter, sender_map, unique_senders,
-                    session_entity_id, session_entity_type,
+                    session_entity_id, session_entity_type, label_to_sid,
                 )
                 logger.debug(
                     f"Personal fact routed: '{fact.get('content', '')[:40]}...' "
@@ -755,7 +781,7 @@ class HippocampusManager:
         return sender_map
 
     async def _build_sender_profiles_context(
-        self, adapter: str, unique_senders: list
+        self, adapter: str, unique_senders: list, token_by_sid: dict | None = None
     ) -> str:
         """为海马体提取构建 sender profile 摘要
 
@@ -764,14 +790,24 @@ class HippocampusManager:
         """
         if not unique_senders:
             return ""
+        if token_by_sid is None:
+            token_by_sid = self._participant_tokens(unique_senders)
 
         parts = []
-        for sid in unique_senders:
+        for i, sid in enumerate(unique_senders):
             entity_id = f"{adapter}:{sid}"
             try:
                 profile = await self.profile_store.get_profile(entity_id, ENTITY_USER)
-                # 用昵称/名字标识，避免暴露系统 entity_id
-                label = profile.name or profile.nickname or str(sid)
+                # Label by a resolved display name (name / nickname / alias);
+                # fall back to the opaque per-turn token, never str(sid) — that's
+                # the bare platform id the plugin must keep out of prompts.
+                label = (
+                    profile.name
+                    or profile.nickname
+                    or (profile.aliases[0] if profile.aliases else "")
+                    or token_by_sid.get(sid)
+                    or _opaque_label(i)
+                )
                 info = []
                 if profile.name:
                     info.append(f"名字: {profile.name}")
@@ -819,6 +855,15 @@ class HippocampusManager:
                     result.append(sid)
         return result
 
+    @staticmethod
+    def _participant_tokens(unique_senders: list) -> dict[str, str]:
+        """Map each distinct sender id → an opaque per-turn token ("用户A", …).
+
+        The token stands in for the raw id everywhere the conversation is shown
+        to the LLM; its inverse (``label_to_sid``) routes extracted facts home,
+        so a canonical id never has to appear in the prompt to preserve routing."""
+        return {sid: _opaque_label(i) for i, sid in enumerate(unique_senders)}
+
     def _resolve_fact_entity(
         self,
         fact: dict,
@@ -827,15 +872,31 @@ class HippocampusManager:
         unique_senders: list[str],
         session_entity_id: str,
         session_entity_type: str,
+        label_to_sid: Optional[dict[str, str]] = None,
     ) -> Tuple[str, str]:
-        """Five-tier routing: speaker_id → subject → "group" → single-user → fallback."""
+        """Five-tier routing: speaker_id → subject → "group" → single-user → fallback.
+
+        ``label_to_sid`` maps the opaque per-turn tokens we showed the LLM
+        ("用户A", …) back to the real sender id. Since the extraction prompt now
+        carries tokens rather than raw ids, the ``speaker_id`` / ``subject`` the
+        model echoes back is a token; we translate it first, then fall through
+        to the legacy raw-id lookups so a directly-fed chunk still routes."""
+        label_to_sid = label_to_sid or {}
         speaker_id = (fact.get("speaker_id", "") or "").strip()
         subject = (fact.get("subject", "") or "").strip()
 
+        tok_sid = label_to_sid.get(speaker_id) or label_to_sid.get(speaker_id.lower())
+        if tok_sid:
+            return f"{adapter}:{tok_sid}", ENTITY_USER
         if speaker_id and speaker_id in sender_map:
             return f"{adapter}:{sender_map[speaker_id]}", ENTITY_USER
+
+        sub_sid = label_to_sid.get(subject) or label_to_sid.get(subject.lower())
+        if sub_sid:
+            return f"{adapter}:{sub_sid}", ENTITY_USER
         if subject and subject.lower() in sender_map:
             return f"{adapter}:{sender_map[subject.lower()]}", ENTITY_USER
+
         if subject.lower() == "group":
             return session_entity_id, ENTITY_GROUP
         if len(unique_senders) == 1:
@@ -843,8 +904,13 @@ class HippocampusManager:
         return session_entity_id, session_entity_type
 
     @staticmethod
-    def _chunks_to_text(chunks: list, sender_map: dict[str, str]) -> str:
-        # Reverse the sender_map (id → preferred display nickname).
+    def _chunks_to_text(
+        chunks: list,
+        sender_map: dict[str, str],
+        token_by_sid: dict[str, str],
+    ) -> str:
+        # Reverse the sender_map (id → preferred display nickname) for messages
+        # that didn't carry a sender_name inline.
         id_to_name: dict[str, str] = {}
         for k, v in sender_map.items():
             # Skip the id→id self entries; only keep the name→id entries.
@@ -857,11 +923,19 @@ class HippocampusManager:
                 role = msg.get("role", "unknown")
                 content = msg.get("content", "")
                 if role == "user":
-                    sender_name = msg.get("sender_name") or id_to_name.get(
-                        msg.get("sender_id", ""), "User"
-                    )
                     sender_id = msg.get("sender_id", "")
-                    label = f"{sender_name}({sender_id})" if sender_id else (sender_name or "User")
+                    sender_name = msg.get("sender_name") or id_to_name.get(sender_id, "")
+                    # Opaque per-turn token in place of the raw sender id: the
+                    # canonical id must never reach the extraction prompt. The
+                    # parenthetical stays the LLM's routing handle, decoded back
+                    # to the real sender via label_to_sid in _resolve_fact_entity.
+                    token = token_by_sid.get(sender_id, "")
+                    if sender_name and token:
+                        label = f"{sender_name}({token})"
+                    elif token:
+                        label = token
+                    else:
+                        label = sender_name or "User"
                     lines.append(f"{label}: {content}")
                 elif role == "assistant":
                     lines.append(f"Bot: {content}")

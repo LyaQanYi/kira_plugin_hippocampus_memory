@@ -590,6 +590,44 @@ def test_entity_search_helpers():
     assert not looks_like_group_id("小明")
 
 
+def test_resolve_source_labels_disambiguates_collisions():
+    """Two entities resolving to the SAME display name stay distinguishable via
+    the opaque token, and the raw entity_id is never used as a label."""
+    from plugins.kira_plugin_hippocampus_memory.adapters.entity_search import (
+        _resolve_source_labels,
+    )
+
+    class _P:
+        def __init__(self, name="", nickname="", aliases=None):
+            self.name = name
+            self.nickname = nickname
+            self.aliases = aliases or []
+
+    class _Store:
+        def __init__(self, by_id):
+            self._by_id = by_id
+
+        async def get_profile(self, eid, etype):
+            return self._by_id.get(eid, _P())
+
+    store = _Store({
+        "telegram:111": _P(name="小明"),
+        "telegram:222": _P(name="小明"),       # same display name → collision
+        "telegram:333": _P(),                   # no name → opaque token
+    })
+    resolved = [("telegram:111", "user"), ("telegram:222", "user"),
+                ("telegram:333", "user")]
+
+    labels = _run(_resolve_source_labels(store, resolved))
+
+    assert labels["telegram:111"] == "小明"
+    assert labels["telegram:222"] == "小明(用户B)"   # disambiguated, not the id
+    assert labels["telegram:333"] == "用户C"          # no name → opaque
+    # No raw entity_id leaks into any label.
+    for v in labels.values():
+        assert "telegram:" not in v and "111" not in v and "222" not in v
+
+
 def test_memory_search_multi_user():
     """memory_search resolves nicknames and searches multiple users in parallel."""
     from plugins.kira_plugin_hippocampus_memory.adapters.entity_search import (
@@ -633,8 +671,11 @@ def test_memory_search_multi_user():
                 list_entities_fn=list_all_entities,
             )
 
-            # Both users resolved + searched, results labelled by entity.
-            assert "telegram:111" in block and "telegram:222" in block
+            # Both users resolved + searched, results labelled by display name
+            # — never the raw canonical entity_id (which must not reach the LLM).
+            assert "[小明]" in block and "[小红]" in block
+            assert "telegram:111" not in block and "telegram:222" not in block
+            assert "111" not in block and "222" not in block
             assert "Python" in block and "JavaScript" in block
 
             # Per-token group guard: a 群-ish token is skipped, not the whole
@@ -711,9 +752,75 @@ def test_build_sender_profiles_context():
             # Unknown sender (no profile, no info) → empty string, not a header.
             assert await mgr._build_sender_profiles_context("telegram", ["999"]) == ""
 
+            # A sender WITH info but NO name/nickname → labelled by an opaque
+            # per-turn token, never the bare platform id (site #2 regression).
+            await mgr.profile_store.add_trait("telegram:222", "潜水")  # trait only
+            anon = await mgr._build_sender_profiles_context("telegram", ["222"])
+            assert "特征: 潜水" in anon
+            assert "【用户A】" in anon          # opaque token (single sender → 用户A)
+            assert "222" not in anon            # bare platform id must not leak
+            assert "telegram:222" not in anon
+
             await mgr.close()
 
     _run(run())
+
+
+# --------------------------------------------------------------------------
+# Site #3: the conversation handed to the extractor must carry an opaque
+# per-turn token, never the raw sender id — yet facts must still route home.
+# --------------------------------------------------------------------------
+
+def test_chunks_to_text_hides_raw_sender_id_but_routes_home():
+    chunks = [[
+        {"role": "user", "sender_id": "111", "sender_name": "小明",
+         "content": "我喜欢 Python"},
+        {"role": "user", "sender_id": "222", "sender_name": "小红",
+         "content": "我用 JavaScript"},
+        {"role": "assistant", "content": "了解了"},
+    ]]
+    sender_map = {"111": "111", "小明": "111", "222": "222", "小红": "222"}
+
+    unique = HippocampusManager._unique_senders(chunks)
+    assert unique == ["111", "222"]
+    token_by_sid = HippocampusManager._participant_tokens(unique)
+    text = HippocampusManager._chunks_to_text(chunks, sender_map, token_by_sid)
+
+    # Display nicknames survive; the raw platform ids do NOT appear anywhere.
+    assert "小明" in text and "小红" in text
+    assert "(111)" not in text and "(222)" not in text
+    assert "111" not in text and "222" not in text
+    # The opaque tokens are the parenthetical the LLM sees instead of the id.
+    assert "小明(用户A)" in text and "小红(用户B)" in text
+
+    # Routing parity: a fact the LLM emits referencing a token routes back to
+    # the real sender id, exactly as the old raw-id parenthetical did.
+    label_to_sid = {tok: sid for sid, tok in token_by_sid.items()}
+    mgr = HippocampusManager.__new__(HippocampusManager)  # no __init__ I/O needed
+    eid, etype = mgr._resolve_fact_entity(
+        {"speaker_id": "用户A", "subject": "小明"}, "telegram", sender_map,
+        unique, "telegram:115", "group", label_to_sid,
+    )
+    assert (eid, etype) == ("telegram:111", "user")
+
+    # A participant rendered as the token alone (no nickname) still routes when
+    # the model puts the token in `subject`.
+    eid2, _ = mgr._resolve_fact_entity(
+        {"speaker_id": "", "subject": "用户B"}, "telegram", sender_map,
+        unique, "telegram:115", "group", label_to_sid,
+    )
+    assert eid2 == "telegram:222"
+
+    # An un-named participant is shown as the bare token, no raw id.
+    anon_chunks = [[
+        {"role": "user", "sender_id": "333", "content": "潜水中"},
+    ]]
+    anon_tokens = HippocampusManager._participant_tokens(
+        HippocampusManager._unique_senders(anon_chunks)
+    )
+    anon_text = HippocampusManager._chunks_to_text(anon_chunks, {}, anon_tokens)
+    assert anon_text == "用户A: 潜水中"
+    assert "333" not in anon_text
 
 
 # --------------------------------------------------------------------------

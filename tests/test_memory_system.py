@@ -852,16 +852,19 @@ def test_resolve_source_labels_sanitizes_and_disambiguates():
         async def get_profile(self, eid, etype):
             return self._by_id[eid]
 
-    # A crafted nickname carrying the line/prefix delimiters must be folded so it
-    # cannot forge a source line in the tool result the agent reads.
+    # A crafted nickname carrying any line/prefix delimiter — brackets, CR/LF,
+    # tab, or the Unicode line separator U+2028 — must be folded so it cannot
+    # forge a source line in the tool result the agent reads.
+    sep = chr(0x2028)  # Unicode LINE SEPARATOR, treated as a break by renderers
     store = _Store({
-        "telegram:1": _P(name="ev]il\nname"),
+        "telegram:1": _P(name="ev]il\nna" + sep + "me\tx"),
         "telegram:2": _P(nickname="小红"),
     })
     labels = _run(_resolve_source_labels(
         store, [("telegram:1", "user"), ("telegram:2", "user")]
     ))
-    assert "]" not in labels["telegram:1"] and "\n" not in labels["telegram:1"]
+    forbidden = "][\r\n\t\x0b\x0c" + chr(0x2028) + chr(0x2029)
+    assert not any(c in labels["telegram:1"] for c in forbidden)
     assert labels["telegram:2"] == "小红"
 
     # A real display name literally equal to an opaque token ("用户B" == the token

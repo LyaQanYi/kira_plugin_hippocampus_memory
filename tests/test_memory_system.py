@@ -1123,3 +1123,348 @@ def test_memory_search_auto_extract_gated():
             await mgr.close()
 
     _run(run())
+
+
+# --------------------------------------------------------------------------
+# Profile upsert: semantic dedup/merge instead of a bare exact-string append
+# (the reported bug: "拍头/摸头" style near-duplicates piling up in a profile)
+# --------------------------------------------------------------------------
+
+def test_profile_upsert_semantic_dedup_and_merge():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            ps = EntityProfileStore()
+
+            async def conflict_check(new, existing):
+                keys = ("摸头", "拍头")
+                if any(k in new for k in keys) and any(k in existing for k in keys):
+                    return "update"
+                return "new"
+
+            async def merge(existing, new):
+                return "喜欢被摸头（合并版）"
+
+            d1 = await ps.upsert_fact(
+                "user1", "喜欢被拍头", conflict_check=conflict_check, merge=merge
+            )
+            assert d1 == "new"
+
+            d2 = await ps.upsert_fact(
+                "user1", "喜欢被摸头", conflict_check=conflict_check, merge=merge
+            )
+            assert d2 == "update"
+
+            p = await ps.get_profile("user1", "user")
+            assert p.facts == ["喜欢被摸头（合并版）"]   # merged in place, not appended
+
+            # Exact-text duplicate short-circuits without even calling conflict_check.
+            calls = []
+
+            async def counting_check(new, existing):
+                calls.append((new, existing))
+                return "new"
+
+            d3 = await ps.upsert_fact(
+                "user1", "喜欢被摸头（合并版）",
+                conflict_check=counting_check, merge=merge,
+            )
+            assert d3 == "duplicate"
+            assert calls == []
+
+            # Unrelated new fact → appended, not merged.
+            d4 = await ps.upsert_fact(
+                "user1", "小明是一名大三学生", conflict_check=conflict_check, merge=merge
+            )
+            assert d4 == "new"
+            p2 = await ps.get_profile("user1", "user")
+            assert len(p2.facts) == 2
+
+            # No conflict_check (e.g. no LLM configured) → degrades to exact
+            # dedup + plain append, never raises.
+            d5 = await ps.upsert_fact("user2", "喜欢喝咖啡")
+            assert d5 == "new"
+            d6 = await ps.upsert_fact("user2", "喜欢喝咖啡")
+            assert d6 == "duplicate"
+
+    _run(run())
+
+
+def test_add_trait_normalizes_case_and_whitespace():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            ps = EntityProfileStore()
+
+            await ps.add_trait("user1", "Nice")
+            await ps.add_trait("user1", " nice ")   # same trait, different case/space
+            await ps.add_trait("user1", "内向")
+
+            p = await ps.get_profile("user1", "user")
+            assert len(p.traits) == 2
+            assert "内向" in p.traits
+
+    _run(run())
+
+
+def test_hippocampus_gates_profile_write_on_dedup_decision():
+    """A fact the TOML pipeline judges "duplicate" must not still land in the
+    profile as fresh (near-duplicate) text — the bug behind the reported
+    "拍头" being recorded several times over."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 1,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+
+            scripted = [
+                json.dumps([
+                    {"content": "小明喜欢被拍头", "speaker_id": "12345",
+                     "subject": "小明", "importance": 8, "tags": [],
+                     "semantic_id": "xm_pat_head"},
+                ]),
+            ]
+            fake = FakeLLM(scripted)
+            mgr.set_clients(llm_client=fake, fast_llm_client=fake)
+
+            cache = SenderCache()
+            mgr.set_sender_cache(cache)
+            sid = "telegram:dm:12345"
+            cache.record(sid, "12345", "小明", "我喜欢被拍头")
+            mgr.submit_chunk(sid, "我喜欢被拍头", "好的")
+
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                with mgr._background_tasks_lock:
+                    if not mgr._background_tasks:
+                        break
+
+            profile = await mgr.get_profile("telegram:12345", "user")
+            assert len(profile.facts) == 1
+
+            # Same underlying habit again, worded differently. The tree's own
+            # dedup (exact-hash miss → FTS + conflict-check) must return
+            # "duplicate"/"update"; either way the profile must NOT grow to 2
+            # near-identical entries.
+            fake.scripted.append(json.dumps([
+                {"content": "小明很喜欢别人摸他的头", "speaker_id": "12345",
+                 "subject": "小明", "importance": 8, "tags": [],
+                 "semantic_id": "xm_pat_head"},
+            ]))
+            # Conflict-check + merge calls triggered by the second round.
+            fake.scripted.append("duplicate")
+
+            cache.record(sid, "12345", "小明", "我很喜欢别人摸我的头")
+            mgr.submit_chunk(sid, "我很喜欢别人摸我的头", "好的")
+
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                with mgr._background_tasks_lock:
+                    if not mgr._background_tasks:
+                        break
+
+            profile2 = await mgr.get_profile("telegram:12345", "user")
+            assert len(profile2.facts) == 1   # still just one, not piled up
+
+            await mgr.close()
+
+    _run(run())
+
+
+# --------------------------------------------------------------------------
+# Profile compaction: shrink a bloated facts list into tagged short bullets;
+# never destroy data on a bad/empty LLM output.
+# --------------------------------------------------------------------------
+
+def test_compact_profile_shrinks_bloated_facts():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 3,
+            })
+            await mgr.async_init()
+
+            bloated = [
+                "小明喜欢被拍头",
+                "小明喜欢被摸头",
+                "小明很喜欢别人摸他的头",
+            ]
+            await mgr.profile_store.update_profile("telegram:111", facts=list(bloated))
+
+            summary = "[互动习惯] 喜欢被摸头/拍头"
+            mgr.set_clients(
+                llm_client=FakeLLM([summary]), fast_llm_client=FakeLLM([summary])
+            )
+
+            compacted = await mgr.compact_profile("telegram:111", "user")
+            assert compacted is True
+
+            p = await mgr.get_profile("telegram:111", "user")
+            assert p.facts == ["[互动习惯] 喜欢被摸头/拍头"]
+
+            # to_prompt() groups by the [标签] prefix rather than dumping a
+            # flat bullet list.
+            prompt = p.to_prompt()
+            assert "[互动习惯] 喜欢被摸头/拍头" in prompt
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_compact_profile_keeps_original_on_parse_failure():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 3,
+            })
+            await mgr.async_init()
+
+            bloated = ["事实一", "事实二", "事实三"]
+            await mgr.profile_store.update_profile("telegram:111", facts=list(bloated))
+
+            # Fast LLM returns an empty string → summarize_profile_facts yields [].
+            mgr.set_clients(llm_client=FakeLLM([""]), fast_llm_client=FakeLLM([""]))
+
+            compacted = await mgr.compact_profile("telegram:111", "user")
+            assert compacted is False
+
+            p = await mgr.get_profile("telegram:111", "user")
+            assert p.facts == bloated   # untouched, nothing destroyed
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_compact_profile_below_threshold_is_noop():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 12,
+            })
+            await mgr.async_init()
+            fake = FakeLLM(["should not be consumed"])
+            mgr.set_clients(llm_client=fake, fast_llm_client=fake)
+
+            await mgr.profile_store.update_profile("telegram:111", facts=["单条事实"])
+            compacted = await mgr.compact_profile("telegram:111", "user")
+            assert compacted is False
+            assert fake.idx == 0   # no LLM call spent on a profile below threshold
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_run_forgetting_cycle_sweeps_bloated_inactive_profiles():
+    """Compaction must not depend solely on a NEW hippocampus write — an
+    inactive user's already-bloated profile is only ever revisited by the
+    periodic sweep piggybacked on run_forgetting_cycle."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 2,
+            })
+            await mgr.async_init()
+
+            await mgr.profile_store.update_profile(
+                "telegram:999", facts=["很水的事实一", "很水的事实二", "很水的事实三"]
+            )
+            summary = "[其他] 精简后的事实"
+            mgr.set_clients(
+                llm_client=FakeLLM([summary]), fast_llm_client=FakeLLM([summary])
+            )
+
+            await mgr.run_forgetting_cycle()
+
+            p = await mgr.get_profile("telegram:999", "user")
+            assert p.facts == ["[其他] 精简后的事实"]
+
+            await mgr.close()
+
+    _run(run())
+
+
+# --------------------------------------------------------------------------
+# Pre-extraction related-memory recall: existing facts most relevant to what
+# a sender just said are surfaced as a hard constraint block, not just the
+# first-5 profile summary (画像去重精简 #1).
+# --------------------------------------------------------------------------
+
+def test_related_memories_context_injects_relevant_facts():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+
+            await mgr.tree_store.add_memory(
+                content_text="小明喜欢用 Python 写后端",
+                memory_type="fact",
+                importance=6,
+                entity_id="telegram:111",
+                entity_type="user",
+                folder="facts",
+            )
+            await mgr.tree_store.add_memory(
+                content_text="小明喜欢深夜写代码",
+                memory_type="fact",
+                importance=5,
+                entity_id="telegram:111",
+                entity_type="user",
+                folder="facts",
+            )
+
+            own_texts = {"111": "我现在还是最喜欢用 Python"}
+            token_by_sid = {"111": "用户A"}
+
+            ctx = await mgr._build_related_memories_context(
+                "telegram", ["111"], own_texts, token_by_sid,
+                is_group=False, session_entity_id="telegram:111",
+            )
+            assert "## 已有相关记忆" in ctx
+            assert "Python" in ctx
+            assert "【用户A】" in ctx
+
+            # No senders / no own text → empty string, nothing forced in.
+            empty_ctx = await mgr._build_related_memories_context(
+                "telegram", [], {}, {}, is_group=False, session_entity_id="telegram:x",
+            )
+            assert empty_ctx == ""
+
+            await mgr.close()
+
+    _run(run())

@@ -7,10 +7,11 @@
 
 import json
 import os
+import re
 import time
 import asyncio
 from dataclasses import dataclass, field, fields, asdict
-from typing import Optional
+from typing import Awaitable, Callable, Optional
 
 from core.logging_manager import get_logger
 from .paths import (
@@ -22,6 +23,55 @@ from .paths import (
 )
 
 logger = get_logger("entity_profile", "green")
+
+# Backstop cap on a single profile fact — the merge/compaction prompts already
+# ask the LLM for short text, but a model that ignores instructions must not
+# be able to write an unbounded paragraph into the profile.
+_FACT_MAX_CHARS = 200
+
+# Matches a "[标签] 内容" prefix left by profile compaction, so to_prompt() can
+# group facts by tag instead of dumping an unbounded flat bullet list.
+_FACT_TAG_RE = re.compile(r"^\[(.+?)\]\s*(.*)$")
+
+ConflictCheckFn = Callable[[str, str], Awaitable[str]]
+MergeFn = Callable[[str, str], Awaitable[str]]
+
+
+def _clip_fact(text: str) -> str:
+    """Hard length backstop, independent of prompt wording (defense in depth)."""
+    text = (text or "").strip()
+    if len(text) > _FACT_MAX_CHARS:
+        text = text[:_FACT_MAX_CHARS].rstrip() + "…"
+    return text
+
+
+def _char_bigrams(text: str) -> set:
+    t = re.sub(r"\s+", "", text or "")
+    if len(t) < 2:
+        return {t} if t else set()
+    return {t[i : i + 2] for i in range(len(t) - 1)}
+
+
+def _similarity(a: str, b: str) -> float:
+    """Cheap Jaccard similarity over character bigrams — good enough to rank
+    which existing facts are worth an LLM conflict-check call against, without
+    pulling in a segmentation dependency here."""
+    sa, sb = _char_bigrams(a), _char_bigrams(b)
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / union if union else 0.0
+
+
+def _rank_candidates(new_fact: str, facts: list, k: int) -> list:
+    """Top-k most similar existing facts (index, text), most similar first.
+
+    Narrows the LLM conflict-check to plausible near-duplicates instead of
+    every fact in the list."""
+    scored = [(i, f, _similarity(new_fact, f)) for i, f in enumerate(facts)]
+    scored.sort(key=lambda x: x[2], reverse=True)
+    return [(i, f) for i, f, s in scored[:k] if s > 0]
 
 
 @dataclass
@@ -90,7 +140,20 @@ class EntityProfile:
             rels = ", ".join(f"{k}: {v}" for k, v in self.relationships.items())
             parts.append(f"关系: {rels}")
         if self.facts:
-            facts_str = "\n  ".join(f"- {f}" for f in self.facts)
+            # Group by a "[标签]" prefix (left by profile compaction) so the
+            # rendered block reads as organized sections rather than an
+            # unbounded flat list; untagged (legacy) facts fall into "其他".
+            grouped: dict[str, list[str]] = {}
+            for f in self.facts:
+                m = _FACT_TAG_RE.match(f)
+                tag, body = (m.group(1), m.group(2)) if m else ("其他", f)
+                grouped.setdefault(tag, []).append(body or f)
+            fact_lines = [
+                f"- [{tag}] {item}"
+                for tag, items in grouped.items()
+                for item in items
+            ]
+            facts_str = "\n  ".join(fact_lines)
             parts.append(f"已知事实:\n  {facts_str}")
         if self.interaction_count:
             parts.append(f"互动次数: {self.interaction_count}")
@@ -157,9 +220,13 @@ class EntityProfileStore:
     # === 便捷方法 ===
 
     async def add_trait(self, entity_id: str, trait: str, entity_type: str = ENTITY_USER):
-        """添加特征标签"""
+        """添加特征标签（大小写/首尾空白归一化后去重，同款 bug 与 add_fact 一并修复）"""
+        trait = (trait or "").strip()
+        if not trait:
+            return
         profile = await self.get_profile(entity_id, entity_type)
-        if trait not in profile.traits:
+        normalized = trait.lower()
+        if not any(t.strip().lower() == normalized for t in profile.traits):
             profile.traits.append(trait)
             await self.save_profile(profile)
 
@@ -171,11 +238,77 @@ class EntityProfileStore:
             await self.save_profile(profile)
 
     async def add_fact(self, entity_id: str, fact: str, entity_type: str = ENTITY_USER):
-        """添加核心事实到画像"""
+        """添加核心事实到画像（精确字符串去重；语义去重见 upsert_fact）"""
         profile = await self.get_profile(entity_id, entity_type)
         if fact not in profile.facts:
             profile.facts.append(fact)
             await self.save_profile(profile)
+
+    async def upsert_fact(
+        self,
+        entity_id: str,
+        fact: str,
+        entity_type: str = ENTITY_USER,
+        *,
+        conflict_check: Optional[ConflictCheckFn] = None,
+        merge: Optional[MergeFn] = None,
+        candidate_k: int = 3,
+    ) -> str:
+        """语义去重/合并后写入画像事实，取代裸 append（画像去重精简 #2）。
+
+        1. 精确匹配（大小写/空白归一化）→ 直接跳过，零 LLM 调用
+        2. 用字符 bigram 相似度挑出最相近的 ``candidate_k`` 条已有事实
+        3. 若提供 ``conflict_check``（复用 MemoryExtractor._check_conflict），
+           逐条判断 duplicate/update/new
+        4. ``update`` 时用 ``merge``（复用 MemoryExtractor.merge_facts）合并后
+           原位替换；``new`` 才追加
+
+        未提供 ``conflict_check``（如未配置 LLM）时退化为精确去重 + 直接追加，
+        保证在没有 LLM 的情况下也能正常工作。
+
+        Returns: "duplicate" | "update" | "new" | "skip"
+        """
+        fact = (fact or "").strip()
+        if not fact:
+            return "skip"
+
+        profile = await self.get_profile(entity_id, entity_type)
+
+        normalized = fact.lower()
+        for existing in profile.facts:
+            if existing.strip().lower() == normalized:
+                return "duplicate"
+
+        if conflict_check is None or not profile.facts:
+            profile.facts.append(_clip_fact(fact))
+            await self.save_profile(profile)
+            return "new"
+
+        candidates = _rank_candidates(fact, profile.facts, candidate_k)
+        for idx, existing in candidates:
+            try:
+                decision = await conflict_check(fact, existing)
+            except Exception as e:
+                logger.debug(f"Profile upsert conflict_check failed: {type(e).__name__}")
+                continue
+            if decision == "duplicate":
+                return "duplicate"
+            if decision == "update":
+                if merge is not None:
+                    try:
+                        merged = await merge(existing, fact)
+                    except Exception as e:
+                        logger.debug(f"Profile upsert merge failed: {type(e).__name__}")
+                        merged = f"{existing}；{fact}"
+                else:
+                    merged = f"{existing}；{fact}"
+                profile.facts[idx] = _clip_fact(merged)
+                await self.save_profile(profile)
+                return "update"
+
+        profile.facts.append(_clip_fact(fact))
+        await self.save_profile(profile)
+        return "new"
 
     async def update_fact(
         self, entity_id: str, old_fact: str, new_fact: str, entity_type: str = ENTITY_USER

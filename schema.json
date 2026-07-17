@@ -95,6 +95,30 @@
             }
         }
     },
+    "profile_compact_threshold": {
+        "type": "integer",
+        "name": "Profile compact trigger (facts)",
+        "default": 12,
+        "hint": "Compact a profile's facts into tagged short bullets once it has at least this many entries.",
+        "locales": {
+            "zh": {
+                "name": "画像压实阈值（条数）",
+                "hint": "画像 facts 条数达到此值时，压实为带标签前缀的规范短句"
+            }
+        }
+    },
+    "profile_compact_max_chars": {
+        "type": "integer",
+        "name": "Profile compact trigger (total chars)",
+        "default": 1200,
+        "hint": "Compact a profile's facts once their combined length reaches this many characters (checked alongside the count threshold).",
+        "locales": {
+            "zh": {
+                "name": "画像压实阈值（总字符数）",
+                "hint": "画像 facts 总字符数达到此值时也会触发压实（与条数阈值任一满足即触发）"
+            }
+        }
+    },
     "extraction_model": {
         "type": "model_select",
         "model_type": "llm",

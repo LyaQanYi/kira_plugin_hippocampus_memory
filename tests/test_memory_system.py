@@ -1809,6 +1809,48 @@ def test_compact_profile_preserves_concurrent_write():
     _run(run())
 
 
+def test_apply_compacted_facts_serializes_concurrent_add():
+    """Greptile P1 follow-up: a write that races between re-read and save must
+    still land — per-entity lock serializes apply_compacted_facts with add_fact
+    so the new fact is either merged into the compact write or appended after."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            await store.update_profile(
+                "telegram:111", facts=["事实一", "事实二", "事实三"]
+            )
+            snapshot = ["事实一", "事实二", "事实三"]
+            compacted = ["[其他] 精简后的事实"]
+
+            lock = store._get_entity_lock("telegram:111", "user")
+            await lock.acquire()
+            try:
+                t_apply = asyncio.create_task(
+                    store.apply_compacted_facts(
+                        "telegram:111", "user", snapshot, compacted
+                    )
+                )
+                t_add = asyncio.create_task(
+                    store.add_fact("telegram:111", "压实空窗期写入的新事实")
+                )
+                # Both tasks should be blocked on the entity lock.
+                await asyncio.sleep(0.05)
+                assert not t_apply.done() and not t_add.done()
+            finally:
+                lock.release()
+
+            updated, _ = await asyncio.gather(t_apply, t_add)
+            assert updated is not None
+
+            p = await store.get_profile("telegram:111", "user")
+            assert "[其他] 精简后的事实" in p.facts
+            assert "压实空窗期写入的新事实" in p.facts
+
+    _run(run())
+
+
 def test_compact_profile_result_stays_below_threshold():
     """After a successful compaction, the resulting fact count must land
     strictly below the threshold, otherwise the very next check would

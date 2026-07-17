@@ -770,9 +770,9 @@ class HippocampusManager:
 
         压实用的是调用开始时的 facts 快照，而 LLM 摘要调用可能耗时——期间
         并发的海马体写入（新提取的高重要性事实）或衰减扫描都可能改动这个
-        实体的画像。落盘前重新读一次当前画像，把快照之后新出现的 facts
-        合并进最终结果，而不是直接用摘要覆盖，否则会静默丢掉那些并发写入
-        （Greptile/Codex P1：compaction race）。
+        实体的画像。落盘走 ``apply_compacted_facts``：在 per-entity 锁内
+        重新读、合并 snapshot 之后新出现的 facts、再写入，与 upsert/add_fact
+        互斥，避免「re-read 与 save 之间又有写入」的 TOCTOU（Greptile P1）。
 
         Returns: 是否真的执行了压实（未达阈值/无可用 LLM/解析失败/落盘失败
         都返回 False）。
@@ -812,20 +812,8 @@ class HippocampusManager:
             )
             return False
 
-        try:
-            current = await self.profile_store.get_profile(entity_id, entity_type)
-        except Exception as e:
-            logger.debug(
-                f"compact_profile: re-read before write failed, using snapshot: "
-                f"{type(e).__name__}"
-            )
-            current = profile
-
-        appended = [f for f in current.facts if f not in snapshot]
-        final_facts = new_facts + [f for f in appended if f not in new_facts]
-
-        updated = await self.profile_store.update_profile(
-            entity_id, entity_type, facts=final_facts
+        updated = await self.profile_store.apply_compacted_facts(
+            entity_id, entity_type, snapshot, new_facts
         )
         if updated is None:
             logger.warning(
@@ -836,7 +824,7 @@ class HippocampusManager:
 
         logger.info(
             f"Profile compacted for {entity_type}:{entity_id}: "
-            f"{len(profile.facts)} → {len(final_facts)} facts"
+            f"{len(profile.facts)} → {len(updated.facts)} facts"
         )
         return True
 

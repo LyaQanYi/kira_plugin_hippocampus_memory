@@ -176,8 +176,21 @@ class EntityProfileStore:
     """
 
     def __init__(self):
+        # Serializes the actual file write. Per-entity locks below coordinate
+        # the wider read-modify-write sequences (upsert / compact merge) so two
+        # mutations for the same entity can't interleave between re-read and
+        # save (Greptile P1: concurrent fact still lost after naive re-merge).
         self._lock = asyncio.Lock()
+        self._entity_locks: dict[str, asyncio.Lock] = {}
         logger.info("EntityProfileStore initialized")
+
+    def _get_entity_lock(self, entity_id: str, entity_type: str) -> asyncio.Lock:
+        key = f"{entity_type}:{entity_id}"
+        lock = self._entity_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._entity_locks[key] = lock
+        return lock
 
     async def get_profile(
         self, entity_id: str, entity_type: str = ENTITY_USER
@@ -219,17 +232,24 @@ class EntityProfileStore:
         ``HippocampusManager.compact_profile``）不能想当然认为字段已经落盘，
         必须据此判断更新是否真的生效，而不是无视 ``save_profile`` 的布尔
         返回值直接报告成功。
+
+        持有 per-entity 锁，避免与 ``apply_compacted_facts`` / ``upsert_fact``
+        交叉覆盖 ``facts``。
         """
-        profile = await self.get_profile(entity_id, entity_type)
-        allowed = {f.name for f in fields(EntityProfile)} - {"entity_id", "entity_type"}
+        async with self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            allowed = {f.name for f in fields(EntityProfile)} - {
+                "entity_id",
+                "entity_type",
+            }
 
-        for key, value in kwargs.items():
-            if key in allowed:
-                setattr(profile, key, value)
+            for key, value in kwargs.items():
+                if key in allowed:
+                    setattr(profile, key, value)
 
-        profile.last_interaction = time.time()
-        ok = await self.save_profile(profile)
-        return profile if ok else None
+            profile.last_interaction = time.time()
+            ok = await self.save_profile(profile)
+            return profile if ok else None
 
     # === 便捷方法 ===
 
@@ -253,10 +273,33 @@ class EntityProfileStore:
 
     async def add_fact(self, entity_id: str, fact: str, entity_type: str = ENTITY_USER):
         """添加核心事实到画像（精确字符串去重；语义去重见 upsert_fact）"""
-        profile = await self.get_profile(entity_id, entity_type)
-        if fact not in profile.facts:
-            profile.facts.append(fact)
-            await self.save_profile(profile)
+        async with self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            if fact not in profile.facts:
+                profile.facts.append(fact)
+                await self.save_profile(profile)
+
+    async def apply_compacted_facts(
+        self,
+        entity_id: str,
+        entity_type: str,
+        snapshot: list,
+        compacted: list[str],
+    ) -> Optional[EntityProfile]:
+        """原子地写入压实结果，并保留 snapshot 之后并发追加的 facts。
+
+        整个 re-read → merge → save 持有该实体的锁，与 ``upsert_fact`` /
+        ``add_fact`` 互斥，堵住「re-read 之后、save 之前又有写入」的 TOCTOU
+        空窗（Greptile P1 follow-up on PR #13）。
+        """
+        async with self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            appended = [f for f in profile.facts if f not in snapshot]
+            final_facts = list(compacted) + [f for f in appended if f not in compacted]
+            profile.facts = final_facts
+            profile.last_interaction = time.time()
+            ok = await self.save_profile(profile)
+            return profile if ok else None
 
     async def upsert_fact(
         self,
@@ -280,6 +323,8 @@ class EntityProfileStore:
         未提供 ``conflict_check``（如未配置 LLM）时退化为精确去重 + 直接追加，
         保证在没有 LLM 的情况下也能正常工作。
 
+        整段 RMW 持有 per-entity 锁，与 ``apply_compacted_facts`` 互斥。
+
         Returns: "duplicate" | "update" | "new" | "skip" | "error"（"error" =
         决策已判定但落盘失败——调用方不能把它当成功处理，见 ``save_profile``
         的布尔返回值检查）
@@ -288,40 +333,45 @@ class EntityProfileStore:
         if not fact:
             return "skip"
 
-        profile = await self.get_profile(entity_id, entity_type)
+        async with self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
 
-        normalized = fact.lower()
-        for existing in profile.facts:
-            if existing.strip().lower() == normalized:
-                return "duplicate"
+            normalized = fact.lower()
+            for existing in profile.facts:
+                if existing.strip().lower() == normalized:
+                    return "duplicate"
 
-        if conflict_check is None or not profile.facts:
+            if conflict_check is None or not profile.facts:
+                profile.facts.append(_clip_fact(fact))
+                return "new" if await self.save_profile(profile) else "error"
+
+            candidates = _rank_candidates(fact, profile.facts, candidate_k)
+            for idx, existing in candidates:
+                try:
+                    decision = await conflict_check(fact, existing)
+                except Exception as e:
+                    logger.debug(
+                        f"Profile upsert conflict_check failed: {type(e).__name__}"
+                    )
+                    continue
+                if decision == "duplicate":
+                    return "duplicate"
+                if decision == "update":
+                    if merge is not None:
+                        try:
+                            merged = await merge(existing, fact)
+                        except Exception as e:
+                            logger.debug(
+                                f"Profile upsert merge failed: {type(e).__name__}"
+                            )
+                            merged = f"{existing}；{fact}"
+                    else:
+                        merged = f"{existing}；{fact}"
+                    profile.facts[idx] = _clip_fact(merged)
+                    return "update" if await self.save_profile(profile) else "error"
+
             profile.facts.append(_clip_fact(fact))
             return "new" if await self.save_profile(profile) else "error"
-
-        candidates = _rank_candidates(fact, profile.facts, candidate_k)
-        for idx, existing in candidates:
-            try:
-                decision = await conflict_check(fact, existing)
-            except Exception as e:
-                logger.debug(f"Profile upsert conflict_check failed: {type(e).__name__}")
-                continue
-            if decision == "duplicate":
-                return "duplicate"
-            if decision == "update":
-                if merge is not None:
-                    try:
-                        merged = await merge(existing, fact)
-                    except Exception as e:
-                        logger.debug(f"Profile upsert merge failed: {type(e).__name__}")
-                        merged = f"{existing}；{fact}"
-                else:
-                    merged = f"{existing}；{fact}"
-                profile.facts[idx] = _clip_fact(merged)
-                return "update" if await self.save_profile(profile) else "error"
-
-        profile.facts.append(_clip_fact(fact))
-        return "new" if await self.save_profile(profile) else "error"
 
     async def update_fact(
         self, entity_id: str, old_fact: str, new_fact: str, entity_type: str = ENTITY_USER

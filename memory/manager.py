@@ -571,7 +571,7 @@ class HippocampusManager:
                     f"Personal fact routed: '{fact.get('content', '')[:40]}...' "
                     f"→ {etype}:{eid}"
                 )
-                decision, final_text = await self.extractor.deduplicate_and_store_ex(
+                decision, final_text, final_importance = await self.extractor.deduplicate_and_store_ex(
                     fact, eid, etype
                 )
                 routed.add((eid, etype))
@@ -579,10 +579,15 @@ class HippocampusManager:
                 # Charter rule #3: high-importance facts also seed the profile —
                 # gated on the TOML dedup decision so a fact already judged a
                 # (near-)duplicate there can't still land in the profile as
-                # fresh text; "update" seeds the profile with the MERGED text,
-                # not the raw pre-dedup extraction.
+                # fresh text; "update" seeds the profile with the MERGED text
+                # and its final (possibly upgraded) importance, not the raw
+                # pre-dedup extraction — otherwise a low-importance correction
+                # that merges into a high-importance memory would be gated out
+                # of the profile by its own (stale) importance.
                 if etype == ENTITY_USER and decision in ("new", "update"):
-                    await self._update_profile_from_fact(eid, etype, fact, final_text)
+                    await self._update_profile_from_fact(
+                        eid, etype, fact, final_text, final_importance
+                    )
 
             for fact in group_facts:
                 logger.debug(
@@ -619,7 +624,12 @@ class HippocampusManager:
             logger.error(f"Hippocampus processing error: {e}", exc_info=True)
 
     async def _update_profile_from_fact(
-        self, entity_id: str, entity_type: str, fact: dict, final_text: str = "",
+        self,
+        entity_id: str,
+        entity_type: str,
+        fact: dict,
+        final_text: str = "",
+        final_importance: Optional[int] = None,
     ) -> None:
         """播种/更新画像事实（宪章 §4.3 铁律 #3）。
 
@@ -627,9 +637,13 @@ class HippocampusManager:
         conflict-check + merge，近义表述会合并到同一条而不是反复堆叠。
         ``final_text`` 优先于 ``fact["content"]``——"update" 决策下它是 TOML
         侧已经合并好的文本，比原始提取更精简、更不易与画像里的旧条目再冲突。
+        ``final_importance`` 同理优先于 ``fact["importance"]``——"update" 决策
+        下它是合并后 TOML 侧的最终重要性（可能已被旧记忆抬升过），门槛判断
+        必须用这个值，否则低重要性的更正合并进高重要性记忆后画像会因为原始
+        重要性不够而错过同步。
         """
         content = (final_text or fact.get("content", "")).strip()
-        importance = fact.get("importance", 5)
+        importance = fact.get("importance", 5) if final_importance is None else final_importance
         if importance < 7 or not content:
             return
         try:
@@ -754,9 +768,16 @@ class HippocampusManager:
         短句（画像去重精简 #3）。只在超过阈值时才跑；解析失败或空输出时保留
         原值，绝不用坏输出覆盖已有画像。
 
-        Returns: 是否真的执行了压实（未达阈值/无 LLM/解析失败都返回 False）。
+        压实用的是调用开始时的 facts 快照，而 LLM 摘要调用可能耗时——期间
+        并发的海马体写入（新提取的高重要性事实）或衰减扫描都可能改动这个
+        实体的画像。落盘前重新读一次当前画像，把快照之后新出现的 facts
+        合并进最终结果，而不是直接用摘要覆盖，否则会静默丢掉那些并发写入
+        （Greptile/Codex P1：compaction race）。
+
+        Returns: 是否真的执行了压实（未达阈值/无可用 LLM/解析失败/落盘失败
+        都返回 False）。
         """
-        if self.extractor is None or self.extractor._llm_client is None:
+        if self.extractor is None or self.extractor.get_fast_client() is None:
             return False
         try:
             profile = await self.profile_store.get_profile(entity_id, entity_type)
@@ -767,9 +788,15 @@ class HippocampusManager:
         if not self._profile_needs_compaction(profile):
             return False
 
+        snapshot = list(profile.facts)
+        # 压实后的条数上限跟着阈值走（而不是固定的模块常量），否则压实结果
+        # 仍可能 ≥ 阈值，导致下一次写入立刻再次触发压实（CodeRabbit：
+        # re-compaction loop）。
+        max_facts = max(1, self._compact_threshold() - 1)
+
         try:
             new_facts = await self.extractor.summarize_profile_facts(
-                profile.facts, profile.traits
+                profile.facts, profile.traits, max_facts=max_facts
             )
         except Exception as e:
             logger.warning(
@@ -785,16 +812,43 @@ class HippocampusManager:
             )
             return False
 
-        await self.profile_store.update_profile(entity_id, entity_type, facts=new_facts)
+        try:
+            current = await self.profile_store.get_profile(entity_id, entity_type)
+        except Exception as e:
+            logger.debug(
+                f"compact_profile: re-read before write failed, using snapshot: "
+                f"{type(e).__name__}"
+            )
+            current = profile
+
+        appended = [f for f in current.facts if f not in snapshot]
+        final_facts = new_facts + [f for f in appended if f not in new_facts]
+
+        updated = await self.profile_store.update_profile(
+            entity_id, entity_type, facts=final_facts
+        )
+        if updated is None:
+            logger.warning(
+                f"compact_profile: persist failed for {entity_type}:{entity_id}, "
+                f"compaction discarded"
+            )
+            return False
+
         logger.info(
             f"Profile compacted for {entity_type}:{entity_id}: "
-            f"{len(profile.facts)} → {len(new_facts)} facts"
+            f"{len(profile.facts)} → {len(final_facts)} facts"
         )
         return True
 
+    def _compact_threshold(self) -> int:
+        """Profile-compaction fact-count threshold, clamped to >= 1 so a
+        misconfigured 0/negative value can't make ``_profile_needs_compaction``
+        permanently true (CodeRabbit: re-compaction loop)."""
+        return max(1, _as_int(self.plugin_cfg.get("profile_compact_threshold"), 12))
+
     def _profile_needs_compaction(self, profile: EntityProfile) -> bool:
-        threshold = _as_int(self.plugin_cfg.get("profile_compact_threshold"), 12)
-        max_chars = _as_int(self.plugin_cfg.get("profile_compact_max_chars"), 1200)
+        threshold = self._compact_threshold()
+        max_chars = max(1, _as_int(self.plugin_cfg.get("profile_compact_max_chars"), 1200))
         if len(profile.facts) >= threshold:
             return True
         total_chars = sum(len(f) for f in profile.facts)

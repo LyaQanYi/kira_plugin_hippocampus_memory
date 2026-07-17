@@ -500,7 +500,7 @@ class MemoryExtractor:
             决策结果 "skip" | "duplicate" | "update" | "new"，供调用方（如手动
             memory_add 工具）反馈给用户/模型。后台海马体流程忽略此返回值。
         """
-        decision, _final_text = await self.deduplicate_and_store_ex(
+        decision, _final_text, _final_importance = await self.deduplicate_and_store_ex(
             fact, entity_id, entity_type
         )
         return decision
@@ -510,18 +510,25 @@ class MemoryExtractor:
         fact: dict,
         entity_id: str,
         entity_type: str = "user",
-    ) -> tuple[str, str]:
-        """同 ``deduplicate_and_store``，但额外返回最终落地的文本。
+    ) -> tuple[str, str, int]:
+        """同 ``deduplicate_and_store``，但额外返回最终落地的文本和重要性。
 
         画像 upsert（画像去重精简 #2）需要在 "update" 时用**合并后**的文本
         播种画像，而不是合并前的原始提取——否则画像会绕开 TOML 侧刚做完的
-        去重结果，重新写入一份近义原文。
+        去重结果，重新写入一份近义原文。同理，"update" 决策下 TOML 侧落地的
+        重要性可能已被旧记忆的更高重要性抬升过（见下方 ``max(importance,
+        matched.importance)``），画像门槛判断必须用这个最终值而不是这次
+        提取的原始 ``fact["importance"]``，否则一条低重要性的更正合并进
+        高重要性记忆后，画像却会因为原始重要性不够而错过同步
+        （CodeRabbit：profile gate uses raw importance）。
 
         Returns:
-            (decision, final_text)
+            (decision, final_text, final_importance)
             decision: "skip" | "duplicate" | "update" | "new"
             final_text: "duplicate" → 命中的旧记忆原文；"update" → 合并后的
-            文本；"new"/"skip" → 传入的 content（"skip" 时为空串）
+            文本（若落盘失败则回退为旧记忆原文，见下）；"new"/"skip" → 传入
+            的 content（"skip" 时为空串）
+            final_importance: 与 final_text 对应的重要性；"skip" 时为 0
         """
         content = fact.get("content", "")
         importance = fact.get("importance", 5)
@@ -529,7 +536,7 @@ class MemoryExtractor:
         semantic_id = fact.get("semantic_id", "")
 
         if not content:
-            return "skip", ""
+            return "skip", "", 0
 
         decision, matched = await self.deduplicate(
             content, entity_id, entity_type, "facts"
@@ -537,13 +544,22 @@ class MemoryExtractor:
 
         if decision == "duplicate":
             logger.debug(f"Duplicate memory skipped: {content[:50]}...")
-            return "duplicate", (matched.text if matched else content)
+            if matched:
+                return "duplicate", matched.text, matched.importance
+            return "duplicate", content, importance
 
         if decision == "update" and matched:
-            # 合并后更新旧记忆
+            # 合并前先留一份旧值：如果落盘失败，TOML 侧仍是旧文本/旧重要性，
+            # 绝不能对外报告一个从未真正写入的合并结果（CodeRabbit outside-diff：
+            # update_memory fail still returns "update"）。
+            original_text = matched.text
+            original_importance = matched.importance
+
             merged_text = await self.merge_facts(matched.text, content)
+            final_importance = max(importance, matched.importance)
+
             matched.text = merged_text
-            matched.importance = max(importance, matched.importance)
+            matched.importance = final_importance
             matched.meta["last_accessed"] = time.time()
 
             # 合并 tags
@@ -551,11 +567,14 @@ class MemoryExtractor:
             existing_tags.update(tags)
             matched.tags = list(existing_tags)
 
-            if await self.tree_store.update_memory(matched):
-                logger.info(f"Memory merged: id={matched.id}")
-            else:
+            if not await self.tree_store.update_memory(matched):
                 logger.warning(f"Failed to merge memory {matched.id}")
-            return "update", merged_text
+                # 落盘失败——TOML 侧仍是旧值。返回非写入决策 + 旧文本，避免
+                # manager 用一条从未落地的合并结果去播种/更新画像。
+                return "skip", original_text, original_importance
+
+            logger.info(f"Memory merged: id={matched.id}")
+            return "update", merged_text, final_importance
 
         # 全新事实 → 写入
         # 尝试获取语义 ID
@@ -573,7 +592,7 @@ class MemoryExtractor:
             folder="facts",
         )
         logger.info(f"New fact stored for {entity_type}:{entity_id}")
-        return "new", content
+        return "new", content, importance
 
     # ==========================================
     # 信息升维（宪章铁律 #2）
@@ -704,17 +723,25 @@ class MemoryExtractor:
     # ==========================================
 
     async def summarize_profile_facts(
-        self, facts: list[str], traits: Optional[list[str]] = None,
+        self,
+        facts: list[str],
+        traits: Optional[list[str]] = None,
+        max_facts: int = _PROFILE_COMPACT_MAX_FACTS,
     ) -> list[str]:
         """把冗长/重复的画像 facts 压实为带 "[标签]" 前缀的规范短句列表。
 
         用于修复已经膨胀的存量画像（例如同一个习惯被反复用不同话描述好几遍）。
         解析失败或空输出时返回 ``[]``——调用方（``HippocampusManager.compact_profile``）
         必须据此保留原值，绝不能用空列表覆盖已有画像。
+
+        ``max_facts`` 由调用方按压实阈值动态传入（而非固定用模块常量），否则
+        压实后 facts 数量仍可能 ≥ 阈值，导致下一次写入立刻再次触发压实
+        （CodeRabbit：re-compaction loop）。
         """
         client = self._fast_or_default
         if not client or not facts:
             return []
+        max_facts = max(1, max_facts)
 
         facts_text = "\n".join(f"- {f}" for f in facts)
         traits_text = f"\n已有特征标签: {', '.join(traits)}" if traits else ""
@@ -728,7 +755,7 @@ class MemoryExtractor:
 - 每条不超过 30 字，一条只说一件事
 - 同义/重复内容只保留一条最准确的表述，不要罗列发生了几次
 - 每条前面加一个 "[标签]" 前缀，标签从以下几类中选：{tags}
-- 按重要性排序，最多输出 {_PROFILE_COMPACT_MAX_FACTS} 条
+- 按重要性排序，最多输出 {max_facts} 条
 - 不要编造原始列表里没有的信息
 
 原始事实列表:
@@ -747,10 +774,17 @@ class MemoryExtractor:
                 ln = re.sub(r"^[-*\d.\s]+(?=\[)", "", ln).strip()
                 if not ln:
                     continue
-                if not re.match(r"^\[.+?\]", ln):
-                    ln = f"[其他] {ln}"
+                # 只接受「[允许的标签] 非空内容」这种规范格式；拒绝语、裸 JSON、
+                # 未打标签的文本等一律视为解析失败整体返回 []，而不是自动包装
+                # 成 "[其他]" 事实去覆盖原始画像（Greptile/CodeRabbit：untagged
+                # LLM output accepted）。
+                match = re.fullmatch(r"\[([^\]\n]+)\]\s+(\S.*)", ln)
+                if match is None or match.group(1) not in _PROFILE_FACT_TAGS:
+                    return []
                 cleaned.append(_clip_merged(ln))
-            return cleaned[:_PROFILE_COMPACT_MAX_FACTS]
+            if not cleaned:
+                return []
+            return cleaned[:max_facts]
         except Exception as e:
             logger.error(f"Profile compaction summarize error: {e}")
             return []

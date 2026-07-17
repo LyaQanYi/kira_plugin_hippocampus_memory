@@ -68,10 +68,18 @@ def _rank_candidates(new_fact: str, facts: list, k: int) -> list:
     """Top-k most similar existing facts (index, text), most similar first.
 
     Narrows the LLM conflict-check to plausible near-duplicates instead of
-    every fact in the list."""
+    every fact in the list. When nothing shares a bigram (e.g. near-synonyms
+    with no literal character overlap, like "程序员" vs "从事软件开发"), the
+    cheap similarity heuristic can't rank anything — but skipping the LLM
+    conflict-check entirely would let those semantic duplicates pile up
+    unchecked, defeating the point of this dedup path. Fall back to the
+    first k facts (unranked) rather than an empty candidate list."""
     scored = [(i, f, _similarity(new_fact, f)) for i, f in enumerate(facts)]
     scored.sort(key=lambda x: x[2], reverse=True)
-    return [(i, f) for i, f, s in scored[:k] if s > 0]
+    positive = [(i, f) for i, f, s in scored[:k] if s > 0]
+    if positive or not scored:
+        return positive
+    return [(i, f) for i, f, _s in scored[:k]]
 
 
 @dataclass
@@ -204,8 +212,14 @@ class EntityProfileStore:
 
     async def update_profile(
         self, entity_id: str, entity_type: str = ENTITY_USER, **kwargs
-    ) -> EntityProfile:
-        """部分更新画像字段"""
+    ) -> Optional[EntityProfile]:
+        """部分更新画像字段。
+
+        Returns: 更新后的画像；持久化失败时返回 ``None``——调用方（例如
+        ``HippocampusManager.compact_profile``）不能想当然认为字段已经落盘，
+        必须据此判断更新是否真的生效，而不是无视 ``save_profile`` 的布尔
+        返回值直接报告成功。
+        """
         profile = await self.get_profile(entity_id, entity_type)
         allowed = {f.name for f in fields(EntityProfile)} - {"entity_id", "entity_type"}
 
@@ -214,8 +228,8 @@ class EntityProfileStore:
                 setattr(profile, key, value)
 
         profile.last_interaction = time.time()
-        await self.save_profile(profile)
-        return profile
+        ok = await self.save_profile(profile)
+        return profile if ok else None
 
     # === 便捷方法 ===
 
@@ -266,7 +280,9 @@ class EntityProfileStore:
         未提供 ``conflict_check``（如未配置 LLM）时退化为精确去重 + 直接追加，
         保证在没有 LLM 的情况下也能正常工作。
 
-        Returns: "duplicate" | "update" | "new" | "skip"
+        Returns: "duplicate" | "update" | "new" | "skip" | "error"（"error" =
+        决策已判定但落盘失败——调用方不能把它当成功处理，见 ``save_profile``
+        的布尔返回值检查）
         """
         fact = (fact or "").strip()
         if not fact:
@@ -281,8 +297,7 @@ class EntityProfileStore:
 
         if conflict_check is None or not profile.facts:
             profile.facts.append(_clip_fact(fact))
-            await self.save_profile(profile)
-            return "new"
+            return "new" if await self.save_profile(profile) else "error"
 
         candidates = _rank_candidates(fact, profile.facts, candidate_k)
         for idx, existing in candidates:
@@ -303,12 +318,10 @@ class EntityProfileStore:
                 else:
                     merged = f"{existing}；{fact}"
                 profile.facts[idx] = _clip_fact(merged)
-                await self.save_profile(profile)
-                return "update"
+                return "update" if await self.save_profile(profile) else "error"
 
         profile.facts.append(_clip_fact(fact))
-        await self.save_profile(profile)
-        return "new"
+        return "new" if await self.save_profile(profile) else "error"
 
     async def update_fact(
         self, entity_id: str, old_fact: str, new_fact: str, entity_type: str = ENTITY_USER

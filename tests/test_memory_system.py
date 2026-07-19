@@ -1888,9 +1888,10 @@ def test_compact_profile_result_stays_below_threshold():
     _run(run())
 
 
-def test_compact_threshold_clamped_to_at_least_one():
-    """A misconfigured 0/negative threshold must not make every profile
-    permanently "need" compaction (CodeRabbit: re-compaction loop)."""
+def test_compact_threshold_clamped_to_at_least_two():
+    """A misconfigured 0/1/negative threshold must clamp to 2 so a single
+    retained fact after compaction does not immediately re-trigger
+    (CodeRabbit: re-compaction loop)."""
     async def run():
         with tempfile.TemporaryDirectory() as tmp:
             set_memory_root(tmp)
@@ -1902,7 +1903,84 @@ def test_compact_threshold_clamped_to_at_least_one():
                 "profile_compact_threshold": 0,
             })
             await mgr.async_init()
-            assert mgr._compact_threshold() == 1
+            assert mgr._compact_threshold() == 2
+
+            await mgr.profile_store.update_profile(
+                "telegram:1", facts=["唯一一条事实"]
+            )
+            p = await mgr.get_profile("telegram:1", "user")
+            assert not mgr._profile_needs_compaction(p)
             await mgr.close()
+
+    _run(run())
+
+
+def test_apply_compacted_facts_aborts_on_snapshot_conflict():
+    """If a snapshot fact was deleted/replaced during the LLM call, discard
+    the stale summary instead of resurrecting it (CodeRabbit)."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            await store.update_profile(
+                "telegram:111", facts=["事实一", "事实二", "事实三"]
+            )
+            snapshot = ["事实一", "事实二", "事实三"]
+            await store.remove_fact("telegram:111", "事实二")
+            updated = await store.apply_compacted_facts(
+                "telegram:111",
+                "user",
+                snapshot,
+                ["[其他] 过期摘要"],
+            )
+            assert updated is None
+            p = await store.get_profile("telegram:111", "user")
+            assert p.facts == ["事实一", "事实三"]
+            assert "[其他] 过期摘要" not in p.facts
+
+    _run(run())
+
+
+def test_increment_interaction_does_not_clobber_compacted_facts():
+    """Greptile P1: a stale interaction RMW must not overwrite facts that
+    landed via compaction while the interaction update was in flight."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            await store.update_profile(
+                "telegram:111",
+                facts=["事实一", "事实二", "事实三"],
+                nickname="旧昵称",
+            )
+
+            lock = store._get_entity_lock("telegram:111", "user")
+            await lock.acquire()
+            try:
+                t_inc = asyncio.create_task(
+                    store.increment_interaction(
+                        "telegram:111", nickname="新昵称"
+                    )
+                )
+                t_apply = asyncio.create_task(
+                    store.apply_compacted_facts(
+                        "telegram:111",
+                        "user",
+                        ["事实一", "事实二", "事实三"],
+                        ["[其他] 压实后的事实"],
+                    )
+                )
+                await asyncio.sleep(0.05)
+                assert not t_inc.done() and not t_apply.done()
+            finally:
+                lock.release()
+
+            await asyncio.gather(t_inc, t_apply)
+            p = await store.get_profile("telegram:111", "user")
+            assert "[其他] 压实后的事实" in p.facts
+            assert p.nickname == "新昵称"
+            assert p.interaction_count >= 1
 
     _run(run())

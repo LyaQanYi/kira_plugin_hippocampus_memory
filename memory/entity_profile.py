@@ -258,18 +258,20 @@ class EntityProfileStore:
         trait = (trait or "").strip()
         if not trait:
             return
-        profile = await self.get_profile(entity_id, entity_type)
-        normalized = trait.lower()
-        if not any(t.strip().lower() == normalized for t in profile.traits):
-            profile.traits.append(trait)
-            await self.save_profile(profile)
+        async with self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            normalized = trait.lower()
+            if not any(t.strip().lower() == normalized for t in profile.traits):
+                profile.traits.append(trait)
+                await self.save_profile(profile)
 
     async def remove_trait(self, entity_id: str, trait: str, entity_type: str = ENTITY_USER):
         """移除特征标签"""
-        profile = await self.get_profile(entity_id, entity_type)
-        if trait in profile.traits:
-            profile.traits.remove(trait)
-            await self.save_profile(profile)
+        async with self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            if trait in profile.traits:
+                profile.traits.remove(trait)
+                await self.save_profile(profile)
 
     async def add_fact(self, entity_id: str, fact: str, entity_type: str = ENTITY_USER):
         """添加核心事实到画像（精确字符串去重；语义去重见 upsert_fact）"""
@@ -291,9 +293,14 @@ class EntityProfileStore:
         整个 re-read → merge → save 持有该实体的锁，与 ``upsert_fact`` /
         ``add_fact`` 互斥，堵住「re-read 之后、save 之前又有写入」的 TOCTOU
         空窗（Greptile P1 follow-up on PR #13）。
+
+        若 snapshot 中任一条在当前 facts 里已缺失（并发删除或原位替换），
+        放弃本次压实并返回 ``None``，避免旧摘要复活过期事实（CodeRabbit）。
         """
         async with self._get_entity_lock(entity_id, entity_type):
             profile = await self.get_profile(entity_id, entity_type)
+            if any(f not in profile.facts for f in snapshot):
+                return None
             appended = [f for f in profile.facts if f not in snapshot]
             final_facts = list(compacted) + [f for f in appended if f not in compacted]
             profile.facts = final_facts
@@ -377,18 +384,20 @@ class EntityProfileStore:
         self, entity_id: str, old_fact: str, new_fact: str, entity_type: str = ENTITY_USER
     ):
         """更新画像中的事实"""
-        profile = await self.get_profile(entity_id, entity_type)
-        if old_fact in profile.facts:
-            idx = profile.facts.index(old_fact)
-            profile.facts[idx] = new_fact
-            await self.save_profile(profile)
+        async with self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            if old_fact in profile.facts:
+                idx = profile.facts.index(old_fact)
+                profile.facts[idx] = new_fact
+                await self.save_profile(profile)
 
     async def remove_fact(self, entity_id: str, fact: str, entity_type: str = ENTITY_USER):
         """移除画像中的事实"""
-        profile = await self.get_profile(entity_id, entity_type)
-        if fact in profile.facts:
-            profile.facts.remove(fact)
-            await self.save_profile(profile)
+        async with self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            if fact in profile.facts:
+                profile.facts.remove(fact)
+                await self.save_profile(profile)
 
     async def set_relationship(
         self,
@@ -398,9 +407,10 @@ class EntityProfileStore:
         entity_type: str = ENTITY_USER,
     ):
         """设置关系"""
-        profile = await self.get_profile(entity_id, entity_type)
-        profile.relationships[target] = relation
-        await self.save_profile(profile)
+        async with self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            profile.relationships[target] = relation
+            await self.save_profile(profile)
 
     async def increment_interaction(
         self, entity_id: str, entity_type: str = ENTITY_USER, **extra_updates
@@ -408,23 +418,27 @@ class EntityProfileStore:
         """递增交互计数并可选更新其他字段
 
         特别处理 nickname 变更：旧昵称自动归档到 aliases。
+
+        整段 RMW 持有 per-entity 锁，避免与压实/upsert 交叉时用陈旧
+        整对象覆盖掉新写入的 facts（Greptile P1 / CodeRabbit on PR #13）。
         """
-        profile = await self.get_profile(entity_id, entity_type)
-        profile.interaction_count += 1
-        profile.last_interaction = time.time()
+        async with self._get_entity_lock(entity_id, entity_type):
+            profile = await self.get_profile(entity_id, entity_type)
+            profile.interaction_count += 1
+            profile.last_interaction = time.time()
 
-        # 昵称变更时，将旧昵称归档到 aliases
-        new_nickname = extra_updates.get("nickname", "")
-        if new_nickname and profile.nickname and new_nickname != profile.nickname:
-            if profile.nickname not in profile.aliases:
-                profile.aliases.append(profile.nickname)
+            # 昵称变更时，将旧昵称归档到 aliases
+            new_nickname = extra_updates.get("nickname", "")
+            if new_nickname and profile.nickname and new_nickname != profile.nickname:
+                if profile.nickname not in profile.aliases:
+                    profile.aliases.append(profile.nickname)
 
-        allowed = {f.name for f in fields(EntityProfile)} - {"entity_id", "entity_type"}
-        for key, value in extra_updates.items():
-            if key in allowed:
-                setattr(profile, key, value)
+            allowed = {f.name for f in fields(EntityProfile)} - {"entity_id", "entity_type"}
+            for key, value in extra_updates.items():
+                if key in allowed:
+                    setattr(profile, key, value)
 
-        await self.save_profile(profile)
+            await self.save_profile(profile)
 
     async def resolve_entity_by_name(
         self, name_query: str, entity_type: str = ENTITY_USER

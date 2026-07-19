@@ -569,8 +569,21 @@ class MemoryExtractor:
 
             if not await self.tree_store.update_memory(matched):
                 logger.warning(f"Failed to merge memory {matched.id}")
-                # 落盘失败——TOML 侧仍是旧值。返回非写入决策 + 旧文本，避免
-                # manager 用一条从未落地的合并结果去播种/更新画像。
+                # update_memory 先写 TOML 再更新索引：False 可能是部分成功
+                # （TOML 已是合并结果、索引失败）。重读磁盘，按真实落盘值
+                # 同步画像，避免 TOML / 索引 / 画像三分叉（CodeRabbit）。
+                try:
+                    persisted = await self.tree_store.get_memory(
+                        matched.id,
+                        entity_id=matched._entity_id,
+                        entity_type=matched._entity_type,
+                        folder=matched._folder,
+                        base_dir=matched._base_dir or "",
+                    )
+                except Exception:
+                    persisted = None
+                if persisted is not None and persisted.text != original_text:
+                    return "update", persisted.text, persisted.importance
                 return "skip", original_text, original_importance
 
             logger.info(f"Memory merged: id={matched.id}")

@@ -26,7 +26,7 @@ from .memory_index import MemoryIndex
 from .toml_tree_store import TomlTreeStore, Memory
 from .memory_extractor import MemoryExtractor
 from .memory_decay import MemoryDecayEngine
-from .entity_profile import EntityProfileStore, EntityProfile
+from .entity_profile import EntityProfileStore, EntityProfile, _FACT_MAX_CHARS
 from .persona_evolution import PersonaEvolutionEngine
 from .paths import (
     get_index_db_path,
@@ -793,6 +793,9 @@ class HippocampusManager:
         # 仍可能 ≥ 阈值，导致下一次写入立刻再次触发压实（CodeRabbit：
         # re-compaction loop）。
         max_facts = max(1, self._compact_threshold() - 1)
+        # Keep post-compact char total under the char trigger as well.
+        char_budget = max(1, self._compact_max_chars() // _FACT_MAX_CHARS)
+        max_facts = min(max_facts, char_budget)
 
         try:
             new_facts = await self.extractor.summarize_profile_facts(
@@ -817,8 +820,9 @@ class HippocampusManager:
         )
         if updated is None:
             logger.warning(
-                f"compact_profile: persist failed for {entity_type}:{entity_id}, "
-                f"compaction discarded"
+                f"compact_profile: persist skipped/failed for "
+                f"{entity_type}:{entity_id} (concurrent mutation or I/O); "
+                f"compaction discarded, will retry later"
             )
             return False
 
@@ -829,18 +833,31 @@ class HippocampusManager:
         return True
 
     def _compact_threshold(self) -> int:
-        """Profile-compaction fact-count threshold, clamped to >= 1 so a
-        misconfigured 0/negative value can't make ``_profile_needs_compaction``
-        permanently true (CodeRabbit: re-compaction loop)."""
-        return max(1, _as_int(self.plugin_cfg.get("profile_compact_threshold"), 12))
+        """Profile-compaction fact-count threshold, clamped to >= 2.
+
+        Compaction always keeps at least one fact, and the trigger uses
+        ``>=``. A threshold of 1 would make every non-empty profile
+        re-compact forever (CodeRabbit: re-compaction loop).
+        """
+        return max(2, _as_int(self.plugin_cfg.get("profile_compact_threshold"), 12))
+
+    def _compact_max_chars(self) -> int:
+        """Char-count trigger, clamped so one clipped fact (~200 chars) cannot
+        permanently re-trigger after a successful compaction."""
+        return max(
+            _FACT_MAX_CHARS,
+            _as_int(self.plugin_cfg.get("profile_compact_max_chars"), 1200),
+        )
 
     def _profile_needs_compaction(self, profile: EntityProfile) -> bool:
         threshold = self._compact_threshold()
-        max_chars = max(1, _as_int(self.plugin_cfg.get("profile_compact_max_chars"), 1200))
+        max_chars = self._compact_max_chars()
         if len(profile.facts) >= threshold:
             return True
         total_chars = sum(len(f) for f in profile.facts)
-        return total_chars >= max_chars
+        # Strict ``>`` so a single fact at the clip length equals the floor
+        # and does not immediately re-trigger (CodeRabbit).
+        return total_chars > max_chars
 
     async def _compact_all_profiles(self) -> int:
         """遍历所有 user 实体，超阈值则压实（画像去重精简 #3：周期扫描）。

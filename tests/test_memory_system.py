@@ -1536,6 +1536,29 @@ def test_upsert_fact_checks_conflict_even_without_bigram_overlap():
     _run(run())
 
 
+def test_upsert_fact_deduplicates_after_length_clipping():
+    """Exact dedup must compare the persisted, clipped representation.
+
+    Comparing an untrimmed input with the previously clipped copy would append
+    the same long fact on every call when no conflict-check client is present.
+    """
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            long_fact = "很长的画像事实" * 50
+
+            assert await store.upsert_fact("user-long", long_fact) == "new"
+            assert await store.upsert_fact("user-long", long_fact) == "duplicate"
+
+            profile = await store.get_profile("user-long", "user")
+            assert len(profile.facts) == 1
+            assert len(profile.facts[0]) <= 200
+
+    _run(run())
+
+
 async def _always_fail_save(profile):
     return False
 
@@ -1882,6 +1905,43 @@ def test_compact_profile_result_stays_below_threshold():
             p = await mgr.get_profile("telegram:333", "user")
             assert len(p.facts) == 2   # threshold(3) - 1
             assert not mgr._profile_needs_compaction(p)
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_compact_profile_clipped_line_stays_within_char_trigger():
+    """The ellipsis must count toward the 200-character hard limit.
+
+    A 201-character "200 chars + ellipsis" result immediately exceeded the
+    minimum char trigger and caused every subsequent check to compact again.
+    """
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 99,
+                "profile_compact_max_chars": 200,
+            })
+            await mgr.async_init()
+
+            await mgr.profile_store.update_profile(
+                "telegram:char-limit", facts=["甲" * 101, "乙" * 101]
+            )
+            summary = "[其他] " + "摘要" * 150
+            fake = FakeLLM([summary])
+            mgr.set_clients(llm_client=fake, fast_llm_client=fake)
+
+            assert await mgr.compact_profile("telegram:char-limit", "user") is True
+            profile = await mgr.get_profile("telegram:char-limit", "user")
+            assert len(profile.facts) == 1
+            assert len(profile.facts[0]) <= mgr._compact_max_chars()
+            assert not mgr._profile_needs_compaction(profile)
 
             await mgr.close()
 

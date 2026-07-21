@@ -41,7 +41,7 @@ def _clip_fact(text: str) -> str:
     """Hard length backstop, independent of prompt wording (defense in depth)."""
     text = (text or "").strip()
     if len(text) > _FACT_MAX_CHARS:
-        text = text[:_FACT_MAX_CHARS].rstrip() + "…"
+        text = text[: _FACT_MAX_CHARS - 1].rstrip() + "…"
     return text
 
 
@@ -336,7 +336,10 @@ class EntityProfileStore:
         决策已判定但落盘失败——调用方不能把它当成功处理，见 ``save_profile``
         的布尔返回值检查）
         """
-        fact = (fact or "").strip()
+        # Normalize to the persisted representation before exact matching.
+        # Otherwise a long fact is compared untrimmed on every call while the
+        # stored copy is clipped, so identical inputs can accumulate forever.
+        fact = _clip_fact(fact)
         if not fact:
             return "skip"
 
@@ -349,7 +352,7 @@ class EntityProfileStore:
                     return "duplicate"
 
             if conflict_check is None or not profile.facts:
-                profile.facts.append(_clip_fact(fact))
+                profile.facts.append(fact)
                 return "new" if await self.save_profile(profile) else "error"
 
             candidates = _rank_candidates(fact, profile.facts, candidate_k)
@@ -377,7 +380,7 @@ class EntityProfileStore:
                     profile.facts[idx] = _clip_fact(merged)
                     return "update" if await self.save_profile(profile) else "error"
 
-            profile.facts.append(_clip_fact(fact))
+            profile.facts.append(fact)
             return "new" if await self.save_profile(profile) else "error"
 
     async def update_fact(

@@ -44,7 +44,7 @@ _PROFILE_FACT_TAGS = ("身份", "性格", "技能兴趣", "互动习惯", "关�
 def _clip_merged(text: str) -> str:
     text = (text or "").strip()
     if len(text) > _MERGE_MAX_CHARS:
-        text = text[:_MERGE_MAX_CHARS].rstrip() + "…"
+        text = text[: _MERGE_MAX_CHARS - 1].rstrip() + "…"
     return text
 
 

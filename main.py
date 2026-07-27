@@ -870,7 +870,9 @@ class HippocampusMemoryPlugin(BasePlugin):
         if self._manager is None:
             return {"error": "not initialized"}
         try:
-            compacted = await self._manager.compact_profile(entity_id, entity_type)
+            compacted = await self._manager.compact_profile(
+                entity_id, entity_type, force=True
+            )
         except Exception as e:
             return {"error": str(e)}
         return {"compacted": compacted}

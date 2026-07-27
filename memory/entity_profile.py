@@ -68,17 +68,11 @@ def _rank_candidates(new_fact: str, facts: list, k: int) -> list:
     """Top-k most similar existing facts (index, text), most similar first.
 
     Narrows the LLM conflict-check to plausible near-duplicates instead of
-    every fact in the list. When nothing shares a bigram (e.g. near-synonyms
-    with no literal character overlap, like "程序员" vs "从事软件开发"), the
-    cheap similarity heuristic can't rank anything — but skipping the LLM
-    conflict-check entirely would let those semantic duplicates pile up
-    unchecked, defeating the point of this dedup path. Fall back to the
-    first k facts (unranked) rather than an empty candidate list."""
+    every fact in the list. Zero-score facts still fill unused slots after
+    positive matches: a weak literal match must not hide a zero-overlap
+    semantic duplicate such as "程序员" vs "从事软件开发"."""
     scored = [(i, f, _similarity(new_fact, f)) for i, f in enumerate(facts)]
     scored.sort(key=lambda x: x[2], reverse=True)
-    positive = [(i, f) for i, f, s in scored[:k] if s > 0]
-    if positive or not scored:
-        return positive
     return [(i, f) for i, f, _s in scored[:k]]
 
 
@@ -192,18 +186,29 @@ class EntityProfileStore:
             self._entity_locks[key] = lock
         return lock
 
+    async def _read_existing_profile(
+        self, entity_id: str, entity_type: str
+    ) -> Optional[EntityProfile]:
+        """Read an existing profile without creating or rewriting it."""
+        fpath = get_entity_profile_path(entity_id, entity_type)
+        if not os.path.exists(fpath):
+            return None
+        try:
+            data = await asyncio.to_thread(self._sync_read, fpath)
+            return EntityProfile.from_dict(data)
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            logger.error(f"Failed to read profile {fpath}: {e}")
+            return None
+
     async def get_profile(
         self, entity_id: str, entity_type: str = ENTITY_USER
     ) -> EntityProfile:
         """获取实体画像，不存在则创建默认画像"""
-        fpath = get_entity_profile_path(entity_id, entity_type)
-
-        if os.path.exists(fpath):
-            try:
-                data = await asyncio.to_thread(self._sync_read, fpath)
-                return EntityProfile.from_dict(data)
-            except Exception as e:
-                logger.error(f"Failed to read profile {fpath}: {e}")
+        profile = await self._read_existing_profile(entity_id, entity_type)
+        if profile is not None:
+            return profile
 
         # 创建默认画像
         profile = EntityProfile(entity_id=entity_id, entity_type=entity_type)
@@ -298,7 +303,12 @@ class EntityProfileStore:
         放弃本次压实并返回 ``None``，避免旧摘要复活过期事实（CodeRabbit）。
         """
         async with self._get_entity_lock(entity_id, entity_type):
-            profile = await self.get_profile(entity_id, entity_type)
+            # Compaction is a compare-and-swap against an existing snapshot.
+            # A missing/corrupt file is a failed precondition, not a reason to
+            # create and persist an empty profile before returning failure.
+            profile = await self._read_existing_profile(entity_id, entity_type)
+            if profile is None:
+                return None
             if any(f not in profile.facts for f in snapshot):
                 return None
             appended = [f for f in profile.facts if f not in snapshot]
@@ -317,6 +327,7 @@ class EntityProfileStore:
         conflict_check: Optional[ConflictCheckFn] = None,
         merge: Optional[MergeFn] = None,
         candidate_k: int = 3,
+        replace_on_duplicate: bool = False,
     ) -> str:
         """语义去重/合并后写入画像事实，取代裸 append（画像去重精简 #2）。
 
@@ -326,6 +337,10 @@ class EntityProfileStore:
            逐条判断 duplicate/update/new
         4. ``update`` 时用 ``merge``（复用 MemoryExtractor.merge_facts）合并后
            原位替换；``new`` 才追加
+
+        ``replace_on_duplicate`` is reserved for an authoritative upstream
+        merge result. When enabled, a semantic duplicate is replaced with the
+        supplied canonical text instead of leaving stale profile wording.
 
         未提供 ``conflict_check``（如未配置 LLM）时退化为精确去重 + 直接追加，
         保证在没有 LLM 的情况下也能正常工作。
@@ -365,6 +380,13 @@ class EntityProfileStore:
                     )
                     continue
                 if decision == "duplicate":
+                    if replace_on_duplicate:
+                        profile.facts[idx] = fact
+                        return (
+                            "update"
+                            if await self.save_profile(profile)
+                            else "error"
+                        )
                     return "duplicate"
                 if decision == "update":
                     if merge is not None:
@@ -521,13 +543,14 @@ class EntityProfileStore:
         self, entity_id: str, entity_type: str = ENTITY_USER
     ) -> bool:
         """删除画像文件"""
-        fpath = get_entity_profile_path(entity_id, entity_type)
-        try:
-            if os.path.exists(fpath):
-                await asyncio.to_thread(os.remove, fpath)
-                return True
-        except Exception as e:
-            logger.error(f"Failed to delete profile {fpath}: {e}")
+        async with self._get_entity_lock(entity_id, entity_type):
+            fpath = get_entity_profile_path(entity_id, entity_type)
+            try:
+                if os.path.exists(fpath):
+                    await asyncio.to_thread(os.remove, fpath)
+                    return True
+            except Exception as e:
+                logger.error(f"Failed to delete profile {fpath}: {e}")
         return False
 
     # === 内部同步 IO ===

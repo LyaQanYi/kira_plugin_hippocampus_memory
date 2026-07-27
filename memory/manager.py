@@ -576,17 +576,18 @@ class HippocampusManager:
                 )
                 routed.add((eid, etype))
 
-                # Charter rule #3: high-importance facts also seed the profile —
-                # gated on the TOML dedup decision so a fact already judged a
-                # (near-)duplicate there can't still land in the profile as
-                # fresh text; "update" seeds the profile with the MERGED text
-                # and its final (possibly upgraded) importance, not the raw
-                # pre-dedup extraction — otherwise a low-importance correction
-                # that merges into a high-importance memory would be gated out
-                # of the profile by its own (stale) importance.
-                if etype == ENTITY_USER and decision in ("new", "update"):
+                # Charter rule #3: high-importance facts also seed the profile.
+                # A TOML duplicate is included so an absent profile can recover
+                # from the canonical matched text. An upstream update supplies
+                # authoritative merged wording for any semantic profile match.
+                if etype == ENTITY_USER and decision in ("new", "update", "duplicate"):
                     await self._update_profile_from_fact(
-                        eid, etype, fact, final_text, final_importance
+                        eid,
+                        etype,
+                        fact,
+                        final_text,
+                        final_importance,
+                        replace_on_duplicate=decision == "update",
                     )
 
             for fact in group_facts:
@@ -630,7 +631,9 @@ class HippocampusManager:
         fact: dict,
         final_text: str = "",
         final_importance: Optional[int] = None,
-    ) -> None:
+        *,
+        replace_on_duplicate: bool = False,
+    ) -> bool:
         """播种/更新画像事实（宪章 §4.3 铁律 #3）。
 
         走语义 upsert（画像去重精简 #2）而非裸 append：复用 extractor 的
@@ -641,20 +644,31 @@ class HippocampusManager:
         下它是合并后 TOML 侧的最终重要性（可能已被旧记忆抬升过），门槛判断
         必须用这个值，否则低重要性的更正合并进高重要性记忆后画像会因为原始
         重要性不够而错过同步。
+
+        Returns whether the profile upsert succeeded (including a no-write
+        duplicate). Persistence failures stop post-write compaction.
         """
         content = (final_text or fact.get("content", "")).strip()
         importance = fact.get("importance", 5) if final_importance is None else final_importance
         if importance < 7 or not content:
-            return
+            return False
         try:
-            await self.profile_store.upsert_fact(
+            result = await self.profile_store.upsert_fact(
                 entity_id, content, entity_type,
                 conflict_check=self.extractor._check_conflict,
                 merge=self.extractor.merge_facts,
+                replace_on_duplicate=replace_on_duplicate,
             )
         except Exception as e:
             logger.debug(f"Profile upsert failed for {entity_type}:{entity_id}: {e}")
-            return
+            return False
+
+        if result in ("error", "skip"):
+            logger.warning(
+                f"Profile upsert did not persist for {entity_type}:{entity_id}: "
+                f"{result}"
+            )
+            return False
 
         # 画像去重精简 #3：写入后即时检查是否需要压实（覆盖活跃用户；不活跃
         # 用户靠 run_forgetting_cycle 里的周期扫描兜底，见 _compact_all_profiles）。
@@ -662,6 +676,7 @@ class HippocampusManager:
             await self.compact_profile(entity_id, entity_type)
         except Exception as e:
             logger.debug(f"Post-write profile compaction failed for {entity_type}:{entity_id}: {e}")
+        return True
 
     async def _collect_self_awareness(self, conversation_text: str) -> None:
         if self.extractor is None or self.extractor._llm_client is None:
@@ -762,7 +777,11 @@ class HippocampusManager:
             return ""
 
     async def compact_profile(
-        self, entity_id: str, entity_type: str = ENTITY_USER,
+        self,
+        entity_id: str,
+        entity_type: str = ENTITY_USER,
+        *,
+        force: bool = False,
     ) -> bool:
         """LLM 压实画像 facts：把冗余/重复的长列表收拢成带 "[标签]" 前缀的规范
         短句（画像去重精简 #3）。只在超过阈值时才跑；解析失败或空输出时保留
@@ -785,7 +804,7 @@ class HippocampusManager:
             logger.debug(f"compact_profile: profile read failed: {type(e).__name__}")
             return False
 
-        if not self._profile_needs_compaction(profile):
+        if not force and not self._profile_needs_compaction(profile):
             return False
 
         snapshot = list(profile.facts)

@@ -504,8 +504,11 @@ class HippocampusMemoryPlugin(BasePlugin):
                             memories.append(m)
 
                 block = self._manager.format_recalled_memories(memories)
+                # A 0/negative value (bad WebUI input) means "don't truncate"
+                # rather than a broken empty/negative slice — same guard as the
+                # profile block above.
                 max_chars = self._int_cfg("max_recall_chars", 1500)
-                if len(block) > max_chars:
+                if max_chars > 0 and len(block) > max_chars:
                     block = block[:max_chars] + "\n…(truncated)"
 
         addition_parts: list[str] = []

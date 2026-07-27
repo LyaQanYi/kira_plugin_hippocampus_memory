@@ -15,6 +15,7 @@ so the orchestrator is unit-testable with a fake LLM + a real manager.
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import List, Optional, Tuple
 
 from core.logging_manager import get_logger
@@ -216,6 +217,12 @@ async def _resolve_source_labels(profile_store, resolved) -> dict:
                 name = p.name or p.nickname or (p.aliases[0] if p.aliases else "")
             except Exception as e:
                 logger.debug(f"source label resolve failed: {type(e).__name__}")
+        # Display names are user-controlled (nickname / alias). Fold the bracket
+        # delimiters plus ALL whitespace and line/paragraph separators (\t \v \f,
+        # CR/LF, and Unicode U+2028/U+2029 — some renderers treat these as line
+        # breaks) so a crafted name can't break the "[source] [type] [tags] text"
+        # line contract or forge a source line in the tool result the agent reads.
+        name = re.sub(r"[\[\]\s\u2028\u2029]+", " ", name).strip()
         token = _opaque_label(i)
         if not name:
             label = token
@@ -223,6 +230,14 @@ async def _resolve_source_labels(profile_store, resolved) -> dict:
             label = f"{name}({token})"
         else:
             label = name
+        # A crafted display name can coincide with the opaque token or with an
+        # already-assigned label (even a #-suffixed one); append an ordinal until
+        # the prefix is free so two sources never share a label.
+        base = label
+        n = 1
+        while label in used:
+            label = f"{base}#{n}"
+            n += 1
         used.add(label)
         labels[eid] = label
     return labels

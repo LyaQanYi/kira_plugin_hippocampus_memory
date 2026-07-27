@@ -30,6 +30,27 @@ def query_from_event(event: Any) -> str:
     ).strip()
 
 
+def query_from_user_prompts(prompts: Any) -> str:
+    """Return the latest persistent user-prompt segment with text.
+
+    KiraAI appends per-turn runtime context such as the current time and
+    session details to ``req.user_prompt``.  Those ``Prompt`` objects have
+    ``persist=False`` and must not become a memory-recall query when the
+    inbound event has no usable message body.
+
+    ``persist`` defaults to ``True`` here so Prompt-like objects from older
+    KiraAI versions (and third-party request builders) retain their existing
+    behaviour.
+    """
+    for prompt in reversed(prompts or []):
+        if getattr(prompt, "persist", True) is False:
+            continue
+        content = getattr(prompt, "content", "") or ""
+        if isinstance(content, str) and content.strip():
+            return content.strip()
+    return ""
+
+
 def sender_users(event):
     """Distinct ``[(entity_id, nickname)]`` for the users who spoke in this batch.
 

@@ -49,6 +49,26 @@ def _install_stubs():
         pm_stub.Prompt = _Prompt
         sys.modules["core.prompt_manager"] = pm_stub
 
+    if "core.plugin" not in sys.modules:
+        plugin_stub = types.ModuleType("core.plugin")
+
+        class _Decorators:
+            def __getattr__(self, _name):
+                return lambda *args, **kwargs: (lambda fn: fn)
+
+        class _Logger:
+            def __getattr__(self, _name):
+                return lambda *args, **kwargs: None
+
+        plugin_stub.BasePlugin = type("BasePlugin", (), {})
+        plugin_stub.logger = _Logger()
+        plugin_stub.on = _Decorators()
+        plugin_stub.register = _Decorators()
+        plugin_stub.Priority = type(
+            "Priority", (), {"HIGH": 1, "LOW": 2, "MEDIUM": 3}
+        )
+        sys.modules["core.plugin"] = plugin_stub
+
     if "plugins" not in sys.modules:
         pkg = types.ModuleType("plugins")
         pkg.__path__ = [str(Path(__file__).resolve().parents[2])]
@@ -77,7 +97,11 @@ from plugins.kira_plugin_hippocampus_memory.memory.entity_profile import (
     EntityProfileStore,
 )
 from plugins.kira_plugin_hippocampus_memory.adapters.sender_cache import SenderCache
-from plugins.kira_plugin_hippocampus_memory.adapters.recall_query import query_from_event
+from plugins.kira_plugin_hippocampus_memory.adapters.recall_query import (
+    query_from_event,
+    query_from_user_prompts,
+)
+from plugins.kira_plugin_hippocampus_memory.main import HippocampusMemoryPlugin
 
 
 class _FakeResp:
@@ -557,6 +581,74 @@ def test_recall_query_from_messages_strips_envelope():
     assert query_from_event(_FakeEvent([])) == ""
     assert query_from_event(_FakeEvent([_FakeMsg(""), _FakeMsg(None)])) == ""
     assert query_from_event(object()) == ""
+
+
+class _FakePrompt:
+    def __init__(self, content, *, persist=True):
+        self.content = content
+        self.persist = persist
+
+
+def test_recall_query_from_user_prompts_skips_nonpersistent_context():
+    prompts = [
+        _FakePrompt("我喜欢用 Python 写脚本"),
+        _FakePrompt("当前时间：2026-07-27；会话：telegram:123", persist=False),
+    ]
+
+    assert query_from_user_prompts(prompts) == "我喜欢用 Python 写脚本"
+
+
+def test_recall_query_from_user_prompts_keeps_legacy_prompt_like_objects():
+    assert query_from_user_prompts([type("LegacyPrompt", (), {
+        "content": "帮我回忆上次的计划"
+    })()]) == "帮我回忆上次的计划"
+
+
+def test_extract_query_skips_nonpersistent_current_context():
+    req = types.SimpleNamespace(
+        user_prompt=[_FakePrompt("当前时间：2026-07-27", persist=False)],
+        messages=[{"role": "user", "content": "上一次的历史对话"}],
+    )
+
+    assert HippocampusMemoryPlugin._extract_query(req) == ""
+
+
+def test_extract_query_skips_mixed_empty_current_context():
+    req = types.SimpleNamespace(
+        user_prompt=[
+            _FakePrompt(""),
+            _FakePrompt("当前时间：2026-07-27", persist=False),
+        ],
+        messages=[{"role": "user", "content": "上一次的历史对话"}],
+    )
+
+    assert HippocampusMemoryPlugin._extract_query(req) == ""
+
+
+def test_extract_query_uses_persistent_prompt_then_legacy_fallback():
+    req = types.SimpleNamespace(
+        user_prompt=[
+            _FakePrompt("实际用户问题"),
+            _FakePrompt("当前时间：2026-07-27", persist=False),
+        ],
+        messages=[{"role": "user", "content": "历史对话"}],
+    )
+    assert HippocampusMemoryPlugin._extract_query(req) == "实际用户问题"
+
+    req = types.SimpleNamespace(
+        user_prompt=[],
+        messages=[
+            {"role": "assistant", "content": "已知"},
+            {"role": "user", "content": "兼容调用的用户问题"},
+        ],
+    )
+    assert HippocampusMemoryPlugin._extract_query(req) == "兼容调用的用户问题"
+
+    req = types.SimpleNamespace(
+        user_prompt=[_FakePrompt("")],
+        messages=[{"role": "user", "content": "空占位符后的用户问题"}],
+    )
+    assert HippocampusMemoryPlugin._extract_query(req) == "空占位符后的用户问题"
 
 
 class _FakeSender:

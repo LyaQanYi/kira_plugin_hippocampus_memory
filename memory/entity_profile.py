@@ -208,6 +208,15 @@ class EntityProfileStore:
         self, entity_id: str, entity_type: str = ENTITY_USER
     ) -> EntityProfile:
         """获取实体画像，不存在则创建默认画像"""
+        async with self._get_entity_lock(entity_id, entity_type):
+            return await self._get_or_create_profile_unlocked(
+                entity_id, entity_type
+            )
+
+    async def _get_or_create_profile_unlocked(
+        self, entity_id: str, entity_type: str
+    ) -> EntityProfile:
+        """Get or create a profile while the caller holds its entity lock."""
         profile = await self._read_existing_profile(entity_id, entity_type)
         if profile is not None:
             return profile
@@ -244,7 +253,9 @@ class EntityProfileStore:
         交叉覆盖 ``facts``。
         """
         async with self._get_entity_lock(entity_id, entity_type):
-            profile = await self.get_profile(entity_id, entity_type)
+            profile = await self._get_or_create_profile_unlocked(
+                entity_id, entity_type
+            )
             allowed = {f.name for f in fields(EntityProfile)} - {
                 "entity_id",
                 "entity_type",
@@ -266,7 +277,9 @@ class EntityProfileStore:
         if not trait:
             return
         async with self._get_entity_lock(entity_id, entity_type):
-            profile = await self.get_profile(entity_id, entity_type)
+            profile = await self._get_or_create_profile_unlocked(
+                entity_id, entity_type
+            )
             normalized = trait.lower()
             if not any(t.strip().lower() == normalized for t in profile.traits):
                 profile.traits.append(trait)
@@ -275,7 +288,9 @@ class EntityProfileStore:
     async def remove_trait(self, entity_id: str, trait: str, entity_type: str = ENTITY_USER):
         """移除特征标签"""
         async with self._get_entity_lock(entity_id, entity_type):
-            profile = await self.get_profile(entity_id, entity_type)
+            profile = await self._get_or_create_profile_unlocked(
+                entity_id, entity_type
+            )
             if trait in profile.traits:
                 profile.traits.remove(trait)
                 await self.save_profile(profile)
@@ -283,7 +298,9 @@ class EntityProfileStore:
     async def add_fact(self, entity_id: str, fact: str, entity_type: str = ENTITY_USER):
         """添加核心事实到画像（精确字符串去重；语义去重见 upsert_fact）"""
         async with self._get_entity_lock(entity_id, entity_type):
-            profile = await self.get_profile(entity_id, entity_type)
+            profile = await self._get_or_create_profile_unlocked(
+                entity_id, entity_type
+            )
             if fact not in profile.facts:
                 profile.facts.append(fact)
                 await self.save_profile(profile)
@@ -368,7 +385,9 @@ class EntityProfileStore:
 
         for _attempt in range(_UPSERT_MAX_RETRIES):
             async with entity_lock:
-                profile = await self.get_profile(entity_id, entity_type)
+                profile = await self._get_or_create_profile_unlocked(
+                    entity_id, entity_type
+                )
                 if any(
                     existing.strip().lower() == normalized
                     for existing in profile.facts
@@ -429,7 +448,9 @@ class EntityProfileStore:
                 break
 
             async with entity_lock:
-                current = await self.get_profile(entity_id, entity_type)
+                current = await self._get_or_create_profile_unlocked(
+                    entity_id, entity_type
+                )
                 if any(
                     existing.strip().lower() == normalized
                     for existing in current.facts
@@ -471,7 +492,9 @@ class EntityProfileStore:
     ):
         """更新画像中的事实"""
         async with self._get_entity_lock(entity_id, entity_type):
-            profile = await self.get_profile(entity_id, entity_type)
+            profile = await self._get_or_create_profile_unlocked(
+                entity_id, entity_type
+            )
             if old_fact in profile.facts:
                 idx = profile.facts.index(old_fact)
                 profile.facts[idx] = new_fact
@@ -480,7 +503,9 @@ class EntityProfileStore:
     async def remove_fact(self, entity_id: str, fact: str, entity_type: str = ENTITY_USER):
         """移除画像中的事实"""
         async with self._get_entity_lock(entity_id, entity_type):
-            profile = await self.get_profile(entity_id, entity_type)
+            profile = await self._get_or_create_profile_unlocked(
+                entity_id, entity_type
+            )
             if fact in profile.facts:
                 profile.facts.remove(fact)
                 await self.save_profile(profile)
@@ -494,7 +519,9 @@ class EntityProfileStore:
     ):
         """设置关系"""
         async with self._get_entity_lock(entity_id, entity_type):
-            profile = await self.get_profile(entity_id, entity_type)
+            profile = await self._get_or_create_profile_unlocked(
+                entity_id, entity_type
+            )
             profile.relationships[target] = relation
             await self.save_profile(profile)
 
@@ -509,7 +536,9 @@ class EntityProfileStore:
         整对象覆盖掉新写入的 facts（Greptile P1 / CodeRabbit on PR #13）。
         """
         async with self._get_entity_lock(entity_id, entity_type):
-            profile = await self.get_profile(entity_id, entity_type)
+            profile = await self._get_or_create_profile_unlocked(
+                entity_id, entity_type
+            )
             profile.interaction_count += 1
             profile.last_interaction = time.time()
 

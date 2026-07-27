@@ -2325,6 +2325,44 @@ def test_apply_compacted_facts_does_not_recreate_missing_profile():
     _run(run())
 
 
+def test_get_profile_creation_is_serialized_with_delete():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            profile_path = Path(
+                get_entity_profile_path("telegram:creating", "user")
+            )
+            save_started = asyncio.Event()
+            allow_save = asyncio.Event()
+            original_save = store.save_profile
+
+            async def delayed_save(profile):
+                save_started.set()
+                await allow_save.wait()
+                return await original_save(profile)
+
+            store.save_profile = delayed_save
+            get_task = asyncio.create_task(
+                store.get_profile("telegram:creating", "user")
+            )
+            await save_started.wait()
+
+            delete_task = asyncio.create_task(
+                store.delete_profile("telegram:creating", "user")
+            )
+            await asyncio.sleep(0)
+            assert not delete_task.done()
+
+            allow_save.set()
+            await get_task
+            assert await delete_task is True
+            assert not profile_path.exists()
+
+    _run(run())
+
+
 def test_increment_interaction_does_not_clobber_compacted_facts():
     """Greptile P1: a stale interaction RMW must not overwrite facts that
     landed via compaction while the interaction update was in flight."""

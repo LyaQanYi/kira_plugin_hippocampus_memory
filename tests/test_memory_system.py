@@ -613,6 +613,18 @@ def test_extract_query_skips_nonpersistent_current_context():
     assert HippocampusMemoryPlugin._extract_query(req) == ""
 
 
+def test_extract_query_skips_mixed_empty_current_context():
+    req = types.SimpleNamespace(
+        user_prompt=[
+            _FakePrompt(""),
+            _FakePrompt("当前时间：2026-07-27", persist=False),
+        ],
+        messages=[{"role": "user", "content": "上一次的历史对话"}],
+    )
+
+    assert HippocampusMemoryPlugin._extract_query(req) == ""
+
+
 def test_extract_query_uses_persistent_prompt_then_legacy_fallback():
     req = types.SimpleNamespace(
         user_prompt=[

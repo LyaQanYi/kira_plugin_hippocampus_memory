@@ -327,13 +327,11 @@ class HippocampusMemoryPlugin(BasePlugin):
         if query:
             return query
         # ``req.messages`` is session history while the llm_request hook runs.
-        # If the current turn supplied only non-persistent runtime context (for
-        # example time/session details), falling back here would recall against
-        # an unrelated historical user turn.  Only callers with no current
-        # user-prompt representation at all may use the legacy fallback.
-        if user_prompts and all(
-            getattr(prompt, "persist", True) is False for prompt in user_prompts
-        ):
+        # Once the current turn has any user-prompt representation, an empty
+        # result means it has no usable persistent user text (for example an
+        # empty message placeholder alongside runtime context). Falling back
+        # would recall against an unrelated historical user turn.
+        if user_prompts:
             return ""
         # Fallback: scan messages list for the last user role entry.
         for msg in reversed(req.messages):

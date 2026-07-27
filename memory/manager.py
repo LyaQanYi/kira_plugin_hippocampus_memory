@@ -1072,7 +1072,7 @@ class HippocampusManager:
         更短的更新句，而不是事后才靠 dedup 补救。
         """
         parts: list[str] = []
-        for sid in unique_senders:
+        for i, sid in enumerate(unique_senders):
             query_text = own_texts.get(sid, "")
             if not query_text:
                 continue
@@ -1093,7 +1093,7 @@ class HippocampusManager:
                 continue
             if not hits:
                 continue
-            label = token_by_sid.get(sid, sid)
+            label = token_by_sid.get(sid) or _opaque_label(i)
             lines = "\n".join(f"- {h.text}" for h in hits)
             parts.append(f"【{label}】\n{lines}")
 

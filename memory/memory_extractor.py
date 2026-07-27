@@ -399,7 +399,27 @@ class MemoryExtractor:
         )
         if exact_match:
             logger.debug(f"Exact hash match: {new_content[:50]}...")
-            return "duplicate", None
+            matched = Memory(
+                id=exact_match["id"],
+                type=exact_match.get("memory_type", "fact"),
+                text=exact_match.get("raw_text", new_content),
+                importance=exact_match.get("importance", 5),
+                tags=exact_match.get("tags", []),
+                source=exact_match.get("source", {}),
+                meta={
+                    "importance": exact_match.get("importance", 5),
+                    "timestamp": exact_match.get("timestamp", 0),
+                    "access_count": exact_match.get("access_count", 0),
+                    "last_accessed": exact_match.get("last_accessed", 0),
+                    "tags": exact_match.get("tags", []),
+                    "source": exact_match.get("source", {}),
+                },
+                _entity_id=exact_match.get("entity_id", entity_id),
+                _entity_type=exact_match.get("entity_type", entity_type),
+                _folder=exact_match.get("folder", folder),
+                _base_dir=exact_match.get("base_dir", ""),
+            )
+            return "duplicate", matched
 
         # === 第二级：FTS5 语义搜索 + LLM 判断（多候选） ===
         existing = await self.tree_store.search(

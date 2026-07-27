@@ -221,6 +221,43 @@ def test_content_hash_dedup():
     _run(run())
 
 
+def test_exact_duplicate_returns_persisted_text_and_importance():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            from plugins.kira_plugin_hippocampus_memory.memory.paths import (
+                get_index_db_path,
+            )
+            store = TomlTreeStore(index=MemoryIndex(db_path=get_index_db_path()))
+            ext = MemoryExtractor(store)
+            content = "完全相同的高重要性事实"
+
+            await store.add_memory(
+                content_text=content,
+                memory_type="fact",
+                importance=8,
+                entity_id="user42",
+                entity_type="user",
+                folder="facts",
+            )
+
+            decision, final_text, final_importance = (
+                await ext.deduplicate_and_store_ex(
+                    {"content": content, "importance": 3},
+                    "user42",
+                    "user",
+                )
+            )
+
+            assert decision == "duplicate"
+            assert final_text == content
+            assert final_importance == 8
+            store.close()
+
+    _run(run())
+
+
 # --------------------------------------------------------------------------
 # Entity profile
 # --------------------------------------------------------------------------
@@ -1470,6 +1507,15 @@ def test_related_memories_context_injects_relevant_facts():
             assert "Python" in ctx
             assert "【用户A】" in ctx
 
+            # Missing token mappings must fall back to an opaque ordinal label,
+            # never the raw platform sender id.
+            fallback_ctx = await mgr._build_related_memories_context(
+                "telegram", ["111"], own_texts, {},
+                is_group=False, session_entity_id="telegram:111",
+            )
+            assert "【用户A】" in fallback_ctx
+            assert "【111】" not in fallback_ctx
+
             # No senders / no own text → empty string, nothing forced in.
             empty_ctx = await mgr._build_related_memories_context(
                 "telegram", [], {}, {}, is_group=False, session_entity_id="telegram:x",
@@ -1615,6 +1661,108 @@ def test_update_profile_returns_none_on_save_failure():
 
             result = await ps.update_profile("userZ", facts=["a"])
             assert result is None
+
+    _run(run())
+
+
+def test_profile_read_error_does_not_overwrite_existing_file():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            await store.update_profile("user-corrupt", facts=["事实"])
+            profile_path = Path(get_entity_profile_path("user-corrupt", "user"))
+            corrupt = "{not valid json"
+            profile_path.write_text(corrupt, encoding="utf-8")
+
+            try:
+                await store.get_profile("user-corrupt", "user")
+            except json.JSONDecodeError:
+                pass
+            else:
+                raise AssertionError("corrupt profile reads must propagate")
+
+            assert profile_path.read_text(encoding="utf-8") == corrupt
+
+    _run(run())
+
+
+def test_profile_sync_write_is_atomic_on_serialization_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        profile_path = Path(tmp) / "profile.json"
+        original = '{"facts": ["safe"]}'
+        profile_path.write_text(original, encoding="utf-8")
+
+        try:
+            EntityProfileStore._sync_write(
+                str(profile_path), {"facts": [object()]}
+            )
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("unserializable profile data must fail")
+
+        assert profile_path.read_text(encoding="utf-8") == original
+        assert not list(profile_path.parent.glob(".profile-*.tmp"))
+
+
+def test_profile_upsert_merge_failure_preserves_existing_fact():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            await store.update_profile("user-merge-fail", facts=["原有事实"])
+
+            async def conflict_check(new, existing):
+                return "update"
+
+            async def failing_merge(existing, new):
+                raise RuntimeError("merge failed")
+
+            result = await store.upsert_fact(
+                "user-merge-fail",
+                "更正后的新事实",
+                conflict_check=conflict_check,
+                merge=failing_merge,
+            )
+
+            assert result == "error"
+            profile = await store.get_profile("user-merge-fail", "user")
+            assert profile.facts == ["原有事实"]
+
+    _run(run())
+
+
+def test_profile_upsert_authoritative_replacement_skips_second_merge():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+
+            for decision in ("duplicate", "update"):
+                entity_id = f"user-authoritative-{decision}"
+                await store.update_profile(entity_id, facts=["旧画像措辞"])
+
+                async def conflict_check(new, existing, result=decision):
+                    return result
+
+                async def merge_must_not_run(existing, new):
+                    raise AssertionError("canonical text must not be merged again")
+
+                result = await store.upsert_fact(
+                    entity_id,
+                    "TOML 最终合并文本",
+                    conflict_check=conflict_check,
+                    merge=merge_must_not_run,
+                    replace_on_duplicate=True,
+                )
+
+                assert result == "update"
+                profile = await store.get_profile(entity_id, "user")
+                assert profile.facts == ["TOML 最终合并文本"]
 
     _run(run())
 
@@ -1768,7 +1916,7 @@ def test_profile_gate_uses_final_merged_importance_not_raw():
                 ]),
                 "update",                      # TOML-level _check_conflict
                 "小明改用 JavaScript 编程",       # merge_facts
-                "duplicate",                   # profile-side _check_conflict
+                "update",                      # profile-side _check_conflict
             ]
             fake = FakeLLM(scripted)
             mgr.set_clients(llm_client=fake, fast_llm_client=fake)

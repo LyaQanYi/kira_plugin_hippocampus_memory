@@ -8,6 +8,7 @@
 import json
 import os
 import re
+import tempfile
 import time
 import asyncio
 from dataclasses import dataclass, field, fields, asdict
@@ -200,7 +201,7 @@ class EntityProfileStore:
             return None
         except Exception as e:
             logger.error(f"Failed to read profile {fpath}: {e}")
-            return None
+            raise
 
     async def get_profile(
         self, entity_id: str, entity_type: str = ENTITY_USER
@@ -304,8 +305,9 @@ class EntityProfileStore:
         """
         async with self._get_entity_lock(entity_id, entity_type):
             # Compaction is a compare-and-swap against an existing snapshot.
-            # A missing/corrupt file is a failed precondition, not a reason to
-            # create and persist an empty profile before returning failure.
+            # A missing file is a failed precondition, not a reason to create
+            # and persist an empty profile before returning failure. Other read
+            # errors propagate so callers cannot mistake corruption for absence.
             profile = await self._read_existing_profile(entity_id, entity_type)
             if profile is None:
                 return None
@@ -379,14 +381,14 @@ class EntityProfileStore:
                         f"Profile upsert conflict_check failed: {type(e).__name__}"
                     )
                     continue
+                if replace_on_duplicate and decision in ("duplicate", "update"):
+                    profile.facts[idx] = fact
+                    return (
+                        "update"
+                        if await self.save_profile(profile)
+                        else "error"
+                    )
                 if decision == "duplicate":
-                    if replace_on_duplicate:
-                        profile.facts[idx] = fact
-                        return (
-                            "update"
-                            if await self.save_profile(profile)
-                            else "error"
-                        )
                     return "duplicate"
                 if decision == "update":
                     if merge is not None:
@@ -396,7 +398,7 @@ class EntityProfileStore:
                             logger.debug(
                                 f"Profile upsert merge failed: {type(e).__name__}"
                             )
-                            merged = f"{existing}；{fact}"
+                            return "error"
                     else:
                         merged = f"{existing}；{fact}"
                     profile.facts[idx] = _clip_fact(merged)
@@ -562,6 +564,20 @@ class EntityProfileStore:
 
     @staticmethod
     def _sync_write(fpath: str, data: dict):
-        os.makedirs(os.path.dirname(fpath), exist_ok=True)
-        with open(fpath, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        directory = os.path.dirname(fpath)
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".profile-", suffix=".tmp", dir=directory
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, fpath)
+        except Exception:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
+            raise

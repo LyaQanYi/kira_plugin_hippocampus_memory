@@ -18,7 +18,12 @@ from core.provider import LLMRequest
 
 from .adapters.llm import append_to_prompt_section
 from .adapters.migration import migrate_simple_memory_if_needed
-from .adapters.recall_query import query_from_event, recall_targets, sender_users
+from .adapters.recall_query import (
+    query_from_event,
+    query_from_user_prompts,
+    recall_targets,
+    sender_users,
+)
 from .adapters.entity_search import (
     search_memories,
     looks_like_entity_id,
@@ -316,11 +321,10 @@ class HippocampusMemoryPlugin(BasePlugin):
 
     @staticmethod
     def _extract_query(req: LLMRequest) -> str:
-        """Pick a recall query from the latest user prompt segment."""
-        for p in reversed(req.user_prompt):
-            content = getattr(p, "content", "") or ""
-            if content.strip():
-                return content.strip()
+        """Pick a recall query from the latest persistent user prompt segment."""
+        query = query_from_user_prompts(req.user_prompt)
+        if query:
+            return query
         # Fallback: scan messages list for the last user role entry.
         for msg in reversed(req.messages):
             if isinstance(msg, dict) and msg.get("role") == "user":

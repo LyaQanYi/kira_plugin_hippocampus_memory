@@ -77,7 +77,10 @@ from plugins.kira_plugin_hippocampus_memory.memory.entity_profile import (
     EntityProfileStore,
 )
 from plugins.kira_plugin_hippocampus_memory.adapters.sender_cache import SenderCache
-from plugins.kira_plugin_hippocampus_memory.adapters.recall_query import query_from_event
+from plugins.kira_plugin_hippocampus_memory.adapters.recall_query import (
+    query_from_event,
+    query_from_user_prompts,
+)
 
 
 class _FakeResp:
@@ -557,6 +560,27 @@ def test_recall_query_from_messages_strips_envelope():
     assert query_from_event(_FakeEvent([])) == ""
     assert query_from_event(_FakeEvent([_FakeMsg(""), _FakeMsg(None)])) == ""
     assert query_from_event(object()) == ""
+
+
+class _FakePrompt:
+    def __init__(self, content, *, persist=True):
+        self.content = content
+        self.persist = persist
+
+
+def test_recall_query_from_user_prompts_skips_nonpersistent_context():
+    prompts = [
+        _FakePrompt("我喜欢用 Python 写脚本"),
+        _FakePrompt("当前时间：2026-07-27；会话：telegram:123", persist=False),
+    ]
+
+    assert query_from_user_prompts(prompts) == "我喜欢用 Python 写脚本"
+
+
+def test_recall_query_from_user_prompts_keeps_legacy_prompt_like_objects():
+    assert query_from_user_prompts([type("LegacyPrompt", (), {
+        "content": "帮我回忆上次的计划"
+    })()]) == "帮我回忆上次的计划"
 
 
 class _FakeSender:

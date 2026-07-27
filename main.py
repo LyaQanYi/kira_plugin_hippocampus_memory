@@ -322,9 +322,19 @@ class HippocampusMemoryPlugin(BasePlugin):
     @staticmethod
     def _extract_query(req: LLMRequest) -> str:
         """Pick a recall query from the latest persistent user prompt segment."""
-        query = query_from_user_prompts(req.user_prompt)
+        user_prompts = getattr(req, "user_prompt", None) or []
+        query = query_from_user_prompts(user_prompts)
         if query:
             return query
+        # ``req.messages`` is session history while the llm_request hook runs.
+        # If the current turn supplied only non-persistent runtime context (for
+        # example time/session details), falling back here would recall against
+        # an unrelated historical user turn.  Only callers with no current
+        # user-prompt representation at all may use the legacy fallback.
+        if user_prompts and all(
+            getattr(prompt, "persist", True) is False for prompt in user_prompts
+        ):
+            return ""
         # Fallback: scan messages list for the last user role entry.
         for msg in reversed(req.messages):
             if isinstance(msg, dict) and msg.get("role") == "user":

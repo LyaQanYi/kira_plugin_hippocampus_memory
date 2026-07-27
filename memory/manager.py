@@ -26,7 +26,7 @@ from .memory_index import MemoryIndex
 from .toml_tree_store import TomlTreeStore, Memory
 from .memory_extractor import MemoryExtractor
 from .memory_decay import MemoryDecayEngine
-from .entity_profile import EntityProfileStore, EntityProfile
+from .entity_profile import EntityProfileStore, EntityProfile, _FACT_MAX_CHARS
 from .persona_evolution import PersonaEvolutionEngine
 from .paths import (
     get_index_db_path,
@@ -526,14 +526,23 @@ class HippocampusManager:
                 label_to_sid[tok.lower()] = sid
 
             conversation_text = self._chunks_to_text(chunks, sender_map, token_by_sid)
+            own_texts = self._own_texts_by_sender(chunks)
 
-            # 构建 sender profile 上下文，辅助 LLM 更准确地提取和路由事实，
-            # 避免重复记录已知信息（精确复刻 lightning memory_manager 的提取增强）。
-            profile_context = await self._build_sender_profiles_context(
-                adapter, unique_senders, token_by_sid
+            # 构建两块提取前上下文，并行获取（互不依赖）：
+            # 1) sender profile 摘要——辅助 LLM 更准确地提取和路由事实，避免
+            #    重复记录已知信息（精确复刻 lightning memory_manager 的提取增强）。
+            # 2) 相关长期记忆召回——用每个参与者本批次的原始发言去 FTS 检索其
+            #    已有 facts，作为硬约束注入，而不只是画像里的前 5 条软提示。
+            profile_context, related_context = await asyncio.gather(
+                self._build_sender_profiles_context(adapter, unique_senders, token_by_sid),
+                self._build_related_memories_context(
+                    adapter, unique_senders, own_texts, token_by_sid,
+                    is_group, session_entity_id,
+                ),
             )
-            if profile_context:
-                conversation_text = f"{profile_context}\n\n{conversation_text}"
+            context_blocks = [c for c in (profile_context, related_context) if c]
+            if context_blocks:
+                conversation_text = "\n\n".join(context_blocks) + "\n\n" + conversation_text
 
             if is_group:
                 personal_facts, group_facts = await asyncio.gather(
@@ -562,12 +571,24 @@ class HippocampusManager:
                     f"Personal fact routed: '{fact.get('content', '')[:40]}...' "
                     f"→ {etype}:{eid}"
                 )
-                await self.extractor.deduplicate_and_store(fact, eid, etype)
+                decision, final_text, final_importance = await self.extractor.deduplicate_and_store_ex(
+                    fact, eid, etype
+                )
                 routed.add((eid, etype))
 
                 # Charter rule #3: high-importance facts also seed the profile.
-                if etype == ENTITY_USER:
-                    await self._update_profile_from_fact(eid, etype, fact)
+                # A TOML duplicate is included so an absent profile can recover
+                # from the canonical matched text. An upstream update supplies
+                # authoritative merged wording for any semantic profile match.
+                if etype == ENTITY_USER and decision in ("new", "update", "duplicate"):
+                    await self._update_profile_from_fact(
+                        eid,
+                        etype,
+                        fact,
+                        final_text,
+                        final_importance,
+                        replace_on_duplicate=decision == "update",
+                    )
 
             for fact in group_facts:
                 logger.debug(
@@ -604,15 +625,58 @@ class HippocampusManager:
             logger.error(f"Hippocampus processing error: {e}", exc_info=True)
 
     async def _update_profile_from_fact(
-        self, entity_id: str, entity_type: str, fact: dict
-    ) -> None:
-        content = fact.get("content", "")
-        importance = fact.get("importance", 5)
-        if importance >= 7 and content:
-            try:
-                await self.profile_store.add_fact(entity_id, content, entity_type)
-            except Exception as e:
-                logger.debug(f"Profile add_fact failed for {entity_type}:{entity_id}: {e}")
+        self,
+        entity_id: str,
+        entity_type: str,
+        fact: dict,
+        final_text: str = "",
+        final_importance: Optional[int] = None,
+        *,
+        replace_on_duplicate: bool = False,
+    ) -> bool:
+        """播种/更新画像事实（宪章 §4.3 铁律 #3）。
+
+        走语义 upsert（画像去重精简 #2）而非裸 append：复用 extractor 的
+        conflict-check + merge，近义表述会合并到同一条而不是反复堆叠。
+        ``final_text`` 优先于 ``fact["content"]``——"update" 决策下它是 TOML
+        侧已经合并好的文本，比原始提取更精简、更不易与画像里的旧条目再冲突。
+        ``final_importance`` 同理优先于 ``fact["importance"]``——"update" 决策
+        下它是合并后 TOML 侧的最终重要性（可能已被旧记忆抬升过），门槛判断
+        必须用这个值，否则低重要性的更正合并进高重要性记忆后画像会因为原始
+        重要性不够而错过同步。
+
+        Returns whether the profile upsert succeeded (including a no-write
+        duplicate). Persistence failures stop post-write compaction.
+        """
+        content = (final_text or fact.get("content", "")).strip()
+        importance = fact.get("importance", 5) if final_importance is None else final_importance
+        if importance < 7 or not content:
+            return False
+        try:
+            result = await self.profile_store.upsert_fact(
+                entity_id, content, entity_type,
+                conflict_check=self.extractor._check_conflict,
+                merge=self.extractor.merge_facts,
+                replace_on_duplicate=replace_on_duplicate,
+            )
+        except Exception as e:
+            logger.debug(f"Profile upsert failed for {entity_type}:{entity_id}: {e}")
+            return False
+
+        if result in ("error", "skip"):
+            logger.warning(
+                f"Profile upsert did not persist for {entity_type}:{entity_id}: "
+                f"{result}"
+            )
+            return False
+
+        # 画像去重精简 #3：写入后即时检查是否需要压实（覆盖活跃用户；不活跃
+        # 用户靠 run_forgetting_cycle 里的周期扫描兜底，见 _compact_all_profiles）。
+        try:
+            await self.compact_profile(entity_id, entity_type)
+        except Exception as e:
+            logger.debug(f"Post-write profile compaction failed for {entity_type}:{entity_id}: {e}")
+        return True
 
     async def _collect_self_awareness(self, conversation_text: str) -> None:
         if self.extractor is None or self.extractor._llm_client is None:
@@ -712,6 +776,126 @@ class HippocampusManager:
             logger.debug(f"build_turn_profile_prompt failed: {type(e).__name__}")
             return ""
 
+    async def compact_profile(
+        self,
+        entity_id: str,
+        entity_type: str = ENTITY_USER,
+        *,
+        force: bool = False,
+    ) -> bool:
+        """LLM 压实画像 facts：把冗余/重复的长列表收拢成带 "[标签]" 前缀的规范
+        短句（画像去重精简 #3）。只在超过阈值时才跑；解析失败或空输出时保留
+        原值，绝不用坏输出覆盖已有画像。
+
+        压实用的是调用开始时的 facts 快照，而 LLM 摘要调用可能耗时——期间
+        并发的海马体写入（新提取的高重要性事实）或衰减扫描都可能改动这个
+        实体的画像。落盘走 ``apply_compacted_facts``：在 per-entity 锁内
+        重新读、合并 snapshot 之后新出现的 facts、再写入，与 upsert/add_fact
+        互斥，避免「re-read 与 save 之间又有写入」的 TOCTOU（Greptile P1）。
+
+        Returns: 是否真的执行了压实（未达阈值/无可用 LLM/解析失败/落盘失败
+        都返回 False）。
+        """
+        if self.extractor is None or self.extractor.get_fast_client() is None:
+            return False
+        try:
+            profile = await self.profile_store.get_profile(entity_id, entity_type)
+        except Exception as e:
+            logger.debug(f"compact_profile: profile read failed: {type(e).__name__}")
+            return False
+
+        if not force and not self._profile_needs_compaction(profile):
+            return False
+
+        snapshot = list(profile.facts)
+        # 压实后的条数上限跟着阈值走（而不是固定的模块常量），否则压实结果
+        # 仍可能 ≥ 阈值，导致下一次写入立刻再次触发压实（CodeRabbit：
+        # re-compaction loop）。
+        max_facts = max(1, self._compact_threshold() - 1)
+        # Keep post-compact char total under the char trigger as well.
+        char_budget = max(1, self._compact_max_chars() // _FACT_MAX_CHARS)
+        max_facts = min(max_facts, char_budget)
+
+        try:
+            new_facts = await self.extractor.summarize_profile_facts(
+                profile.facts, profile.traits, max_facts=max_facts
+            )
+        except Exception as e:
+            logger.warning(
+                f"compact_profile: summarize failed, keeping original facts: "
+                f"{type(e).__name__}"
+            )
+            return False
+
+        if not new_facts:
+            logger.warning(
+                f"compact_profile: empty/unparseable summary for "
+                f"{entity_type}:{entity_id}, keeping original facts"
+            )
+            return False
+
+        updated = await self.profile_store.apply_compacted_facts(
+            entity_id, entity_type, snapshot, new_facts
+        )
+        if updated is None:
+            logger.warning(
+                f"compact_profile: persist skipped/failed for "
+                f"{entity_type}:{entity_id} (concurrent mutation or I/O); "
+                f"compaction discarded, will retry later"
+            )
+            return False
+
+        logger.info(
+            f"Profile compacted for {entity_type}:{entity_id}: "
+            f"{len(profile.facts)} → {len(updated.facts)} facts"
+        )
+        return True
+
+    def _compact_threshold(self) -> int:
+        """Profile-compaction fact-count threshold, clamped to >= 2.
+
+        Compaction always keeps at least one fact, and the trigger uses
+        ``>=``. A threshold of 1 would make every non-empty profile
+        re-compact forever (CodeRabbit: re-compaction loop).
+        """
+        return max(2, _as_int(self.plugin_cfg.get("profile_compact_threshold"), 12))
+
+    def _compact_max_chars(self) -> int:
+        """Char-count trigger, clamped so one clipped fact (~200 chars) cannot
+        permanently re-trigger after a successful compaction."""
+        return max(
+            _FACT_MAX_CHARS,
+            _as_int(self.plugin_cfg.get("profile_compact_max_chars"), 1200),
+        )
+
+    def _profile_needs_compaction(self, profile: EntityProfile) -> bool:
+        threshold = self._compact_threshold()
+        max_chars = self._compact_max_chars()
+        if len(profile.facts) >= threshold:
+            return True
+        total_chars = sum(len(f) for f in profile.facts)
+        # Strict ``>`` so a single fact at the clip length equals the floor
+        # and does not immediately re-trigger (CodeRabbit).
+        return total_chars > max_chars
+
+    async def _compact_all_profiles(self) -> int:
+        """遍历所有 user 实体，超阈值则压实（画像去重精简 #3：周期扫描）。
+
+        只靠写入触发的压实覆盖不到不再互动的用户——那份画像永远等不到下一次
+        `_update_profile_from_fact` 调用。复用现有衰减周期（`run_forgetting_cycle`
+        走 `decay_interval_hours` 调度），无需新增定时器/配置项。
+        """
+        from .paths import list_all_entities
+
+        count = 0
+        for entity_id, entity_type in list_all_entities(ENTITY_USER):
+            try:
+                if await self.compact_profile(entity_id, entity_type):
+                    count += 1
+            except Exception as e:
+                logger.debug(f"Compaction sweep skipped an entity: {type(e).__name__}")
+        return count
+
     async def update_user_interaction(
         self, user_id: str, platform: str = "", nickname: str = ""
     ) -> None:
@@ -731,10 +915,22 @@ class HippocampusManager:
 
     async def run_forgetting_cycle(self) -> tuple[int, int]:
         try:
-            return await self.decay_engine.run_full_cycle()
+            deleted, downgraded = await self.decay_engine.run_full_cycle()
         except Exception as e:
             logger.error(f"Forgetting cycle failed: {e}")
-            return 0, 0
+            deleted, downgraded = 0, 0
+
+        # Piggyback the profile-compaction sweep on the same periodic cycle
+        # (画像去重精简 #3) so bloated-but-inactive profiles eventually get
+        # fixed even without a new hippocampus write.
+        try:
+            compacted = await self._compact_all_profiles()
+            if compacted:
+                logger.info(f"Forgetting cycle: compacted {compacted} bloated profile(s)")
+        except Exception as e:
+            logger.warning(f"Profile compaction sweep failed: {e}")
+
+        return deleted, downgraded
 
     async def run_evolution_cycle(self) -> None:
         if self.persona_engine.persona_manager is None:
@@ -839,6 +1035,94 @@ class HippocampusManager:
             "## 参与者已知信息（以下是对话中提到的用户的已有画像，"
             "提取事实时请避免重复记录这些已有内容）\n"
             + "\n".join(parts)
+        )
+
+    @staticmethod
+    def _own_texts_by_sender(chunks: list) -> dict[str, str]:
+        """Map each sender id → its own message text in this batch (joined).
+
+        Used as the FTS query for pre-extraction related-memory recall: a
+        single sender's own words match their existing facts far more
+        precisely than the multi-speaker labelled ``conversation_text``,
+        which dilutes the query with everyone else's phrasing."""
+        texts: dict[str, list[str]] = {}
+        for chunk in chunks:
+            for msg in chunk:
+                if msg.get("role") != "user":
+                    continue
+                sid = msg.get("sender_id", "")
+                content = (msg.get("content") or "").strip()
+                if sid and content:
+                    texts.setdefault(sid, []).append(content)
+        return {sid: " ".join(parts) for sid, parts in texts.items()}
+
+    async def _build_related_memories_context(
+        self,
+        adapter: str,
+        unique_senders: list[str],
+        own_texts: dict[str, str],
+        token_by_sid: dict[str, str],
+        is_group: bool,
+        session_entity_id: str,
+    ) -> str:
+        """提取前 FTS 召回每个参与者最相关的已有 facts，作为硬约束注入提取
+        输入（画像去重精简 #1）——不同于 ``_build_sender_profiles_context``
+        只给前 5 条软提示，这里按本批次每个人**实际说的话**去检索，命中更
+        精准，能让提取 LLM 在写新事实前就看到已有的近义记忆，从而跳过或写
+        更短的更新句，而不是事后才靠 dedup 补救。
+        """
+        parts: list[str] = []
+        for i, sid in enumerate(unique_senders):
+            query_text = own_texts.get(sid, "")
+            if not query_text:
+                continue
+            entity_id = f"{adapter}:{sid}"
+            try:
+                hits = await self.tree_store.search(
+                    query=query_text,
+                    entity_id=entity_id,
+                    entity_type=ENTITY_USER,
+                    folder="facts",
+                    k=5,
+                    update_access=False,
+                )
+            except Exception as e:
+                logger.debug(
+                    f"Related-memory recall skipped for a sender: {type(e).__name__}"
+                )
+                continue
+            if not hits:
+                continue
+            label = token_by_sid.get(sid) or _opaque_label(i)
+            lines = "\n".join(f"- {h.text}" for h in hits)
+            parts.append(f"【{label}】\n{lines}")
+
+        if is_group:
+            group_query = " ".join(t for t in own_texts.values() if t)
+            if group_query:
+                try:
+                    group_hits = await self.tree_store.search(
+                        query=group_query,
+                        entity_id=session_entity_id,
+                        entity_type=ENTITY_GROUP,
+                        folder="facts",
+                        k=5,
+                        update_access=False,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"Related group-memory recall skipped: {type(e).__name__}"
+                    )
+                    group_hits = []
+                if group_hits:
+                    lines = "\n".join(f"- {h.text}" for h in group_hits)
+                    parts.append(f"【群组】\n{lines}")
+
+        if not parts:
+            return ""
+        return (
+            "## 已有相关记忆（勿重复；仅在有实质更新时提取更短的更新句，"
+            "已完全覆盖的内容不要再提取）\n" + "\n\n".join(parts)
         )
 
     @staticmethod

@@ -66,6 +66,7 @@ _install_stubs()
 from plugins.kira_plugin_hippocampus_memory.memory.paths import (
     set_memory_root,
     ensure_directory_structure,
+    get_entity_profile_path,
     get_global_facts_dir,
 )
 from plugins.kira_plugin_hippocampus_memory.memory.manager import HippocampusManager
@@ -215,6 +216,43 @@ def test_content_hash_dedup():
             assert found is not None
             assert found["raw_text"] == content
 
+            store.close()
+
+    _run(run())
+
+
+def test_exact_duplicate_returns_persisted_text_and_importance():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            from plugins.kira_plugin_hippocampus_memory.memory.paths import (
+                get_index_db_path,
+            )
+            store = TomlTreeStore(index=MemoryIndex(db_path=get_index_db_path()))
+            ext = MemoryExtractor(store)
+            content = "完全相同的高重要性事实"
+
+            await store.add_memory(
+                content_text=content,
+                memory_type="fact",
+                importance=8,
+                entity_id="user42",
+                entity_type="user",
+                folder="facts",
+            )
+
+            decision, final_text, final_importance = (
+                await ext.deduplicate_and_store_ex(
+                    {"content": content, "importance": 3},
+                    "user42",
+                    "user",
+                )
+            )
+
+            assert decision == "duplicate"
+            assert final_text == content
+            assert final_importance == 8
             store.close()
 
     _run(run())
@@ -1121,5 +1159,1311 @@ def test_memory_search_auto_extract_gated():
             assert "吃辣" in on
 
             await mgr.close()
+
+    _run(run())
+
+
+# --------------------------------------------------------------------------
+# Profile upsert: semantic dedup/merge instead of a bare exact-string append
+# (the reported bug: "拍头/摸头" style near-duplicates piling up in a profile)
+# --------------------------------------------------------------------------
+
+def test_profile_upsert_semantic_dedup_and_merge():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            ps = EntityProfileStore()
+
+            async def conflict_check(new, existing):
+                keys = ("摸头", "拍头")
+                if any(k in new for k in keys) and any(k in existing for k in keys):
+                    return "update"
+                return "new"
+
+            async def merge(existing, new):
+                return "喜欢被摸头（合并版）"
+
+            d1 = await ps.upsert_fact(
+                "user1", "喜欢被拍头", conflict_check=conflict_check, merge=merge
+            )
+            assert d1 == "new"
+
+            d2 = await ps.upsert_fact(
+                "user1", "喜欢被摸头", conflict_check=conflict_check, merge=merge
+            )
+            assert d2 == "update"
+
+            p = await ps.get_profile("user1", "user")
+            assert p.facts == ["喜欢被摸头（合并版）"]   # merged in place, not appended
+
+            # Exact-text duplicate short-circuits without even calling conflict_check.
+            calls = []
+
+            async def counting_check(new, existing):
+                calls.append((new, existing))
+                return "new"
+
+            d3 = await ps.upsert_fact(
+                "user1", "喜欢被摸头（合并版）",
+                conflict_check=counting_check, merge=merge,
+            )
+            assert d3 == "duplicate"
+            assert calls == []
+
+            # Unrelated new fact → appended, not merged.
+            d4 = await ps.upsert_fact(
+                "user1", "小明是一名大三学生", conflict_check=conflict_check, merge=merge
+            )
+            assert d4 == "new"
+            p2 = await ps.get_profile("user1", "user")
+            assert len(p2.facts) == 2
+
+            # No conflict_check (e.g. no LLM configured) → degrades to exact
+            # dedup + plain append, never raises.
+            d5 = await ps.upsert_fact("user2", "喜欢喝咖啡")
+            assert d5 == "new"
+            d6 = await ps.upsert_fact("user2", "喜欢喝咖啡")
+            assert d6 == "duplicate"
+
+    _run(run())
+
+
+def test_add_trait_normalizes_case_and_whitespace():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            ps = EntityProfileStore()
+
+            await ps.add_trait("user1", "Nice")
+            await ps.add_trait("user1", " nice ")   # same trait, different case/space
+            await ps.add_trait("user1", "内向")
+
+            p = await ps.get_profile("user1", "user")
+            assert len(p.traits) == 2
+            assert "内向" in p.traits
+
+    _run(run())
+
+
+def test_hippocampus_gates_profile_write_on_dedup_decision():
+    """A fact the TOML pipeline judges "duplicate" must not still land in the
+    profile as fresh (near-duplicate) text — the bug behind the reported
+    "拍头" being recorded several times over."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 1,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+
+            scripted = [
+                json.dumps([
+                    {"content": "小明喜欢被拍头", "speaker_id": "12345",
+                     "subject": "小明", "importance": 8, "tags": [],
+                     "semantic_id": "xm_pat_head"},
+                ]),
+            ]
+            fake = FakeLLM(scripted)
+            mgr.set_clients(llm_client=fake, fast_llm_client=fake)
+
+            cache = SenderCache()
+            mgr.set_sender_cache(cache)
+            sid = "telegram:dm:12345"
+            cache.record(sid, "12345", "小明", "我喜欢被拍头")
+            mgr.submit_chunk(sid, "我喜欢被拍头", "好的")
+
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                with mgr._background_tasks_lock:
+                    if not mgr._background_tasks:
+                        break
+
+            profile = await mgr.get_profile("telegram:12345", "user")
+            assert len(profile.facts) == 1
+            assert await mgr.profile_store.delete_profile(
+                "telegram:12345", "user"
+            )
+
+            # Same underlying habit again, worded differently. The tree's own
+            # dedup returns "duplicate". A missing profile must be reseeded from
+            # the matched TOML text, not from the fresh near-duplicate wording.
+            fake.scripted.append(json.dumps([
+                {"content": "小明很喜欢别人摸他的头", "speaker_id": "12345",
+                 "subject": "小明", "importance": 8, "tags": [],
+                 "semantic_id": "xm_pat_head"},
+            ]))
+            # Conflict-check + merge calls triggered by the second round.
+            fake.scripted.append("duplicate")
+
+            cache.record(sid, "12345", "小明", "我很喜欢别人摸我的头")
+            mgr.submit_chunk(sid, "我很喜欢别人摸我的头", "好的")
+
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                with mgr._background_tasks_lock:
+                    if not mgr._background_tasks:
+                        break
+
+            profile2 = await mgr.get_profile("telegram:12345", "user")
+            assert profile2.facts == ["小明喜欢被拍头"]
+
+            await mgr.close()
+
+    _run(run())
+
+
+# --------------------------------------------------------------------------
+# Profile compaction: shrink a bloated facts list into tagged short bullets;
+# never destroy data on a bad/empty LLM output.
+# --------------------------------------------------------------------------
+
+def test_compact_profile_shrinks_bloated_facts():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 3,
+            })
+            await mgr.async_init()
+
+            bloated = [
+                "小明喜欢被拍头",
+                "小明喜欢被摸头",
+                "小明很喜欢别人摸他的头",
+            ]
+            await mgr.profile_store.update_profile("telegram:111", facts=list(bloated))
+
+            summary = "[互动习惯] 喜欢被摸头/拍头"
+            mgr.set_clients(
+                llm_client=FakeLLM([summary]), fast_llm_client=FakeLLM([summary])
+            )
+
+            compacted = await mgr.compact_profile("telegram:111", "user")
+            assert compacted is True
+
+            p = await mgr.get_profile("telegram:111", "user")
+            assert p.facts == ["[互动习惯] 喜欢被摸头/拍头"]
+
+            # to_prompt() groups by the [标签] prefix rather than dumping a
+            # flat bullet list.
+            prompt = p.to_prompt()
+            assert "[互动习惯] 喜欢被摸头/拍头" in prompt
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_compact_profile_keeps_original_on_parse_failure():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 3,
+            })
+            await mgr.async_init()
+
+            bloated = ["事实一", "事实二", "事实三"]
+            await mgr.profile_store.update_profile("telegram:111", facts=list(bloated))
+
+            # Fast LLM returns an empty string → summarize_profile_facts yields [].
+            mgr.set_clients(llm_client=FakeLLM([""]), fast_llm_client=FakeLLM([""]))
+
+            compacted = await mgr.compact_profile("telegram:111", "user")
+            assert compacted is False
+
+            p = await mgr.get_profile("telegram:111", "user")
+            assert p.facts == bloated   # untouched, nothing destroyed
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_compact_profile_below_threshold_is_noop_unless_forced():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 12,
+            })
+            await mgr.async_init()
+            fake = FakeLLM(["[其他] 手动压实后的事实"])
+            mgr.set_clients(llm_client=fake, fast_llm_client=fake)
+
+            await mgr.profile_store.update_profile("telegram:111", facts=["单条事实"])
+            compacted = await mgr.compact_profile("telegram:111", "user")
+            assert compacted is False
+            assert fake.idx == 0   # no LLM call spent on a profile below threshold
+
+            compacted = await mgr.compact_profile(
+                "telegram:111", "user", force=True
+            )
+            assert compacted is True
+            assert fake.idx == 1
+            profile = await mgr.get_profile("telegram:111", "user")
+            assert profile.facts == ["[其他] 手动压实后的事实"]
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_run_forgetting_cycle_sweeps_bloated_inactive_profiles():
+    """Compaction must not depend solely on a NEW hippocampus write — an
+    inactive user's already-bloated profile is only ever revisited by the
+    periodic sweep piggybacked on run_forgetting_cycle."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 2,
+            })
+            await mgr.async_init()
+
+            await mgr.profile_store.update_profile(
+                "telegram:999", facts=["很水的事实一", "很水的事实二", "很水的事实三"]
+            )
+            summary = "[其他] 精简后的事实"
+            mgr.set_clients(
+                llm_client=FakeLLM([summary]), fast_llm_client=FakeLLM([summary])
+            )
+
+            await mgr.run_forgetting_cycle()
+
+            p = await mgr.get_profile("telegram:999", "user")
+            assert p.facts == ["[其他] 精简后的事实"]
+
+            await mgr.close()
+
+    _run(run())
+
+
+# --------------------------------------------------------------------------
+# Pre-extraction related-memory recall: existing facts most relevant to what
+# a sender just said are surfaced as a hard constraint block, not just the
+# first-5 profile summary (画像去重精简 #1).
+# --------------------------------------------------------------------------
+
+def test_related_memories_context_injects_relevant_facts():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+
+            await mgr.tree_store.add_memory(
+                content_text="小明喜欢用 Python 写后端",
+                memory_type="fact",
+                importance=6,
+                entity_id="telegram:111",
+                entity_type="user",
+                folder="facts",
+            )
+            await mgr.tree_store.add_memory(
+                content_text="小明喜欢深夜写代码",
+                memory_type="fact",
+                importance=5,
+                entity_id="telegram:111",
+                entity_type="user",
+                folder="facts",
+            )
+
+            own_texts = {"111": "我现在还是最喜欢用 Python"}
+            token_by_sid = {"111": "用户A"}
+
+            ctx = await mgr._build_related_memories_context(
+                "telegram", ["111"], own_texts, token_by_sid,
+                is_group=False, session_entity_id="telegram:111",
+            )
+            assert "## 已有相关记忆" in ctx
+            assert "Python" in ctx
+            assert "【用户A】" in ctx
+
+            # Missing token mappings must fall back to an opaque ordinal label,
+            # never the raw platform sender id.
+            fallback_ctx = await mgr._build_related_memories_context(
+                "telegram", ["111"], own_texts, {},
+                is_group=False, session_entity_id="telegram:111",
+            )
+            assert "【用户A】" in fallback_ctx
+            assert "【111】" not in fallback_ctx
+
+            # No senders / no own text → empty string, nothing forced in.
+            empty_ctx = await mgr._build_related_memories_context(
+                "telegram", [], {}, {}, is_group=False, session_entity_id="telegram:x",
+            )
+            assert empty_ctx == ""
+
+            await mgr.close()
+
+    _run(run())
+
+
+# --------------------------------------------------------------------------
+# PR #13 review fixes: compaction race, untagged-output rejection, zero-bigram
+# fallback, save-failure propagation, importance-gate correctness, and the
+# update_memory-failure decision.
+# --------------------------------------------------------------------------
+
+def test_rank_candidates_falls_back_when_no_positive_similarity():
+    """Zero bigram overlap must not skip the semantic conflict-check
+    entirely — it should fall back to the first-k facts instead of an empty
+    candidate list (CodeRabbit)."""
+    from plugins.kira_plugin_hippocampus_memory.memory.entity_profile import (
+        _rank_candidates,
+    )
+
+    facts = ["abc", "xyz789"]
+    candidates = _rank_candidates("完全不同的中文内容", facts, k=3)
+    assert len(candidates) == 2
+    assert {f for _, f in candidates} == set(facts)
+
+    # When a positive-similarity match exists, ranking still prefers it.
+    facts2 = ["喜欢被拍头", "今天天气不错"]
+    ranked = _rank_candidates("喜欢被摸头", facts2, k=3)
+    assert ranked[0][1] == "喜欢被拍头"
+    assert len(ranked) == 2
+
+    # A positive literal match must not leave the remaining candidate slots
+    # empty and hide a zero-overlap semantic duplicate.
+    facts3 = ["软件安装指南", "程序员", "喜欢喝咖啡"]
+    filled = _rank_candidates("从事软件开发工作", facts3, k=3)
+    assert len(filled) == 3
+    assert filled[0][1] == "软件安装指南"
+    assert "程序员" in {fact for _, fact in filled}
+
+    # No existing facts at all → no candidates, not an error.
+    assert _rank_candidates("任意内容", [], k=3) == []
+
+
+def test_upsert_fact_checks_conflict_even_without_bigram_overlap():
+    """A semantic duplicate with zero literal character overlap (e.g.
+    "程序员" vs "从事软件开发工作") must still reach conflict_check instead of
+    being silently appended as a brand-new fact."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            ps = EntityProfileStore()
+
+            calls = []
+
+            async def conflict_check(new, existing):
+                calls.append((new, existing))
+                if {new, existing} == {"从事软件开发工作", "程序员"}:
+                    return "update"
+                return "new"
+
+            async def merge(existing, new):
+                return "软件工程师"
+
+            d1 = await ps.upsert_fact(
+                "userX", "从事软件开发工作", conflict_check=conflict_check, merge=merge
+            )
+            assert d1 == "new"
+
+            d2 = await ps.upsert_fact(
+                "userX", "程序员", conflict_check=conflict_check, merge=merge
+            )
+            assert calls, "conflict_check must be consulted even with zero bigram overlap"
+            assert d2 == "update"
+
+            p = await ps.get_profile("userX", "user")
+            assert p.facts == ["软件工程师"]
+
+    _run(run())
+
+
+def test_upsert_fact_deduplicates_after_length_clipping():
+    """Exact dedup must compare the persisted, clipped representation.
+
+    Comparing an untrimmed input with the previously clipped copy would append
+    the same long fact on every call when no conflict-check client is present.
+    """
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            long_fact = "很长的画像事实" * 50
+
+            assert await store.upsert_fact("user-long", long_fact) == "new"
+            assert await store.upsert_fact("user-long", long_fact) == "duplicate"
+
+            profile = await store.get_profile("user-long", "user")
+            assert len(profile.facts) == 1
+            assert len(profile.facts[0]) <= 200
+
+    _run(run())
+
+
+async def _always_fail_save(profile):
+    return False
+
+
+def test_upsert_fact_reports_error_when_save_fails():
+    """A persistence failure must not be reported as "new"/"update" — the
+    caller would otherwise believe a fact landed when it never did
+    (CodeRabbit: ignored save_profile() bool)."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            ps = EntityProfileStore()
+            ps.save_profile = _always_fail_save
+
+            d1 = await ps.upsert_fact("userY", "喜欢喝咖啡")
+            assert d1 == "error"
+
+            # Nothing was actually persisted (save always failed).
+            ps_read = EntityProfileStore()
+            p = await ps_read.get_profile("userY", "user")
+            assert "喜欢喝咖啡" not in p.facts
+
+    _run(run())
+
+
+def test_update_profile_returns_none_on_save_failure():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            ps = EntityProfileStore()
+            ps.save_profile = _always_fail_save
+
+            result = await ps.update_profile("userZ", facts=["a"])
+            assert result is None
+
+    _run(run())
+
+
+def test_profile_read_error_does_not_overwrite_existing_file():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            await store.update_profile("user-corrupt", facts=["事实"])
+            profile_path = Path(get_entity_profile_path("user-corrupt", "user"))
+            corrupt = "{not valid json"
+            profile_path.write_text(corrupt, encoding="utf-8")
+
+            try:
+                await store.get_profile("user-corrupt", "user")
+            except json.JSONDecodeError:
+                pass
+            else:
+                raise AssertionError("corrupt profile reads must propagate")
+
+            assert profile_path.read_text(encoding="utf-8") == corrupt
+
+    _run(run())
+
+
+def test_profile_sync_write_is_atomic_on_serialization_failure():
+    with tempfile.TemporaryDirectory() as tmp:
+        profile_path = Path(tmp) / "profile.json"
+        original = '{"facts": ["safe"]}'
+        profile_path.write_text(original, encoding="utf-8")
+
+        try:
+            EntityProfileStore._sync_write(
+                str(profile_path), {"facts": [object()]}
+            )
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("unserializable profile data must fail")
+
+        assert profile_path.read_text(encoding="utf-8") == original
+        assert not list(profile_path.parent.glob(".profile-*.tmp"))
+
+
+def test_profile_upsert_merge_failure_preserves_existing_fact():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            await store.update_profile("user-merge-fail", facts=["原有事实"])
+
+            async def conflict_check(new, existing):
+                return "update"
+
+            async def failing_merge(existing, new):
+                raise RuntimeError("merge failed")
+
+            result = await store.upsert_fact(
+                "user-merge-fail",
+                "更正后的新事实",
+                conflict_check=conflict_check,
+                merge=failing_merge,
+            )
+
+            assert result == "error"
+            profile = await store.get_profile("user-merge-fail", "user")
+            assert profile.facts == ["原有事实"]
+
+    _run(run())
+
+
+def test_profile_upsert_authoritative_replacement_skips_second_merge():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+
+            for decision in ("duplicate", "update"):
+                entity_id = f"user-authoritative-{decision}"
+                await store.update_profile(entity_id, facts=["旧画像措辞"])
+
+                async def conflict_check(new, existing, result=decision):
+                    return result
+
+                async def merge_must_not_run(existing, new):
+                    raise AssertionError("canonical text must not be merged again")
+
+                result = await store.upsert_fact(
+                    entity_id,
+                    "TOML 最终合并文本",
+                    conflict_check=conflict_check,
+                    merge=merge_must_not_run,
+                    replace_on_duplicate=True,
+                )
+
+                assert result == "update"
+                profile = await store.get_profile(entity_id, "user")
+                assert profile.facts == ["TOML 最终合并文本"]
+
+    _run(run())
+
+
+def test_merge_fallback_preserves_new_fact_when_llm_fails():
+    class FailingLLM:
+        async def chat(self, req):
+            raise RuntimeError("merge unavailable")
+
+    async def run():
+        ext = MemoryExtractor(_StubStore())
+        ext.set_fast_llm_client(FailingLLM())
+        new_fact = "这是不能丢失的新更正"
+
+        merged = await ext.merge_facts("旧事实" * 100, new_fact)
+
+        assert new_fact in merged
+        assert len(merged) <= 200
+
+    _run(run())
+
+
+def test_profile_upsert_releases_entity_lock_during_llm_calls():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            entity_id = "user-slow-check"
+            await store.update_profile(entity_id, facts=["原有事实"])
+
+            check_started = asyncio.Event()
+            release_check = asyncio.Event()
+
+            async def slow_conflict_check(new, existing):
+                check_started.set()
+                await release_check.wait()
+                return "duplicate"
+
+            upsert_task = asyncio.create_task(
+                store.upsert_fact(
+                    entity_id,
+                    "近义的新事实",
+                    conflict_check=slow_conflict_check,
+                )
+            )
+            try:
+                await asyncio.wait_for(check_started.wait(), timeout=1)
+                await asyncio.wait_for(
+                    store.increment_interaction(entity_id),
+                    timeout=1,
+                )
+            finally:
+                release_check.set()
+
+            assert await upsert_task == "duplicate"
+            profile = await store.get_profile(entity_id, "user")
+            assert profile.interaction_count == 1
+
+    _run(run())
+
+
+def test_profile_upsert_retries_after_concurrent_fact_change():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            entity_id = "user-cas-retry"
+            await store.update_profile(entity_id, facts=["原有事实"])
+            injected = False
+
+            async def conflict_check(new, existing):
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    await store.add_fact(entity_id, "并发写入的事实")
+                return "new"
+
+            result = await store.upsert_fact(
+                entity_id,
+                "本次新增事实",
+                conflict_check=conflict_check,
+            )
+
+            assert result == "new"
+            profile = await store.get_profile(entity_id, "user")
+            assert profile.facts == [
+                "原有事实",
+                "并发写入的事实",
+                "本次新增事实",
+            ]
+
+    _run(run())
+
+
+def test_profile_upsert_failure_skips_post_write_compaction():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+            mgr.profile_store.save_profile = _always_fail_save
+
+            compact_called = False
+
+            async def track_compaction(*args, **kwargs):
+                nonlocal compact_called
+                compact_called = True
+                return False
+
+            mgr.compact_profile = track_compaction
+            updated = await mgr._update_profile_from_fact(
+                "telegram:save-failure",
+                "user",
+                {"content": "重要事实", "importance": 8},
+            )
+
+            assert updated is False
+            assert compact_called is False
+            await mgr.close()
+
+    _run(run())
+
+
+def test_summarize_profile_facts_rejects_malformed_output():
+    """Untagged text, refusals, or an unrecognized tag must make the whole
+    summary a parse failure (return []) instead of being auto-wrapped into a
+    "[其他]" fact that would then replace every existing profile fact
+    (Greptile P1 / CodeRabbit)."""
+    async def run():
+        ext = MemoryExtractor(_StubStore())
+
+        ext.set_fast_llm_client(FakeLLM(["抱歉，我无法完成这个摘要请求。"]))
+        assert await ext.summarize_profile_facts(["事实一", "事实二"]) == []
+
+        ext.set_fast_llm_client(FakeLLM(["[乱写标签] 一些内容"]))
+        assert await ext.summarize_profile_facts(["事实一", "事实二"]) == []
+
+        ext.set_fast_llm_client(FakeLLM(["[其他]   "]))  # allowed tag, empty body
+        assert await ext.summarize_profile_facts(["事实一", "事实二"]) == []
+
+        ext.set_fast_llm_client(FakeLLM(['["some", "json"]']))
+        assert await ext.summarize_profile_facts(["事实一", "事实二"]) == []
+
+        # A properly tagged, non-empty line still works.
+        ext.set_fast_llm_client(FakeLLM(["[身份] 是一名学生"]))
+        assert await ext.summarize_profile_facts(["事实一", "事实二"]) == ["[身份] 是一名学生"]
+
+    _run(run())
+
+
+def test_summarize_profile_facts_respects_max_facts():
+    async def run():
+        ext = MemoryExtractor(_StubStore())
+        text = "\n".join(f"[身份] 事实{i}" for i in range(5))
+        ext.set_fast_llm_client(FakeLLM([text]))
+
+        result = await ext.summarize_profile_facts(["a", "b"], max_facts=2)
+        assert len(result) == 2
+
+    _run(run())
+
+
+def test_deduplicate_and_store_ex_returns_skip_when_merge_persist_fails():
+    """If the merge's ``update_memory`` write fails, the decision must not
+    still be reported as "update" with the merged text — that would let the
+    manager seed/update the profile with a merge that never landed on disk
+    (CodeRabbit outside-diff)."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            from plugins.kira_plugin_hippocampus_memory.memory.paths import (
+                get_index_db_path,
+            )
+            store = TomlTreeStore(index=MemoryIndex(db_path=get_index_db_path()))
+            ext = MemoryExtractor(store)
+
+            await store.add_memory(
+                content_text="小明喜欢用 Python 编程",
+                memory_type="fact",
+                importance=5,
+                entity_id="telegram:111",
+                entity_type="user",
+                folder="facts",
+            )
+
+            fake = FakeLLM(["update", "小明改用 JavaScript 编程"])
+            ext.set_llm_client(fake)
+            ext.set_fast_llm_client(fake)
+
+            async def _failing_update_memory(memory):
+                return False
+
+            store.update_memory = _failing_update_memory
+
+            fact = {"content": "小明改用 JavaScript 编程了", "importance": 9, "tags": []}
+            decision, final_text, final_importance = await ext.deduplicate_and_store_ex(
+                fact, "telegram:111", "user"
+            )
+
+            assert decision == "skip"
+            assert final_text == "小明喜欢用 Python 编程"
+            assert final_importance == 5
+
+            store.close()
+
+    _run(run())
+
+
+def test_deduplicate_and_store_ex_keeps_persisted_metadata_update():
+    """A TOML-only importance/tag update remains successful when the index
+    write fails, even if the merged wording itself is unchanged."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            from plugins.kira_plugin_hippocampus_memory.memory.paths import (
+                get_index_db_path,
+            )
+            store = TomlTreeStore(index=MemoryIndex(db_path=get_index_db_path()))
+            ext = MemoryExtractor(store)
+
+            memory = await store.add_memory(
+                content_text="小明喜欢用 Python 编程",
+                memory_type="fact",
+                importance=5,
+                tags=["preference"],
+                entity_id="telegram:111",
+                entity_type="user",
+                folder="facts",
+            )
+
+            fake = FakeLLM(["update", memory.text])
+            ext.set_llm_client(fake)
+            ext.set_fast_llm_client(fake)
+
+            def _failing_index_upsert(**kwargs):
+                raise RuntimeError("index unavailable")
+
+            store.index.upsert = _failing_index_upsert
+
+            fact = {
+                "content": "小明一直喜欢用 Python 编程",
+                "importance": 9,
+                "tags": ["confirmed"],
+            }
+            decision, final_text, final_importance = (
+                await ext.deduplicate_and_store_ex(
+                    fact, "telegram:111", "user"
+                )
+            )
+
+            assert decision == "update"
+            assert final_text == memory.text
+            assert final_importance == 9
+
+            persisted = await store.get_memory(
+                memory.id,
+                entity_id="telegram:111",
+                entity_type="user",
+                folder="facts",
+            )
+            assert persisted is not None
+            assert persisted.importance == 9
+            assert set(persisted.tags) == {"preference", "confirmed"}
+
+            store.close()
+
+    _run(run())
+
+
+def test_profile_gate_uses_final_merged_importance_not_raw():
+    """A low-importance correction (importance=3) that TOML-side merges into
+    an existing high-importance memory (upgraded via ``max(...)``) must still
+    sync to the profile — the gate must use the FINAL importance, not the
+    raw extracted value (CodeRabbit)."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 1,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+            })
+            await mgr.async_init()
+
+            scripted = [
+                json.dumps([
+                    {"content": "小明喜欢用 Python 编程", "speaker_id": "12345",
+                     "subject": "小明", "importance": 8, "tags": [],
+                     "semantic_id": "xm_python"},
+                ]),
+                json.dumps([
+                    {"content": "小明现在改用 JavaScript 编程了", "speaker_id": "12345",
+                     "subject": "小明", "importance": 3, "tags": [],
+                     "semantic_id": "xm_js"},
+                ]),
+                "update",                      # TOML-level _check_conflict
+                "小明改用 JavaScript 编程",       # merge_facts
+                "update",                      # profile-side _check_conflict
+            ]
+            fake = FakeLLM(scripted)
+            mgr.set_clients(llm_client=fake, fast_llm_client=fake)
+
+            cache = SenderCache()
+            mgr.set_sender_cache(cache)
+            sid = "telegram:dm:12345"
+
+            cache.record(sid, "12345", "小明", "我喜欢用 Python 编程")
+            mgr.submit_chunk(sid, "我喜欢用 Python 编程", "好的")
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                with mgr._background_tasks_lock:
+                    if not mgr._background_tasks:
+                        break
+
+            profile1 = await mgr.get_profile("telegram:12345", "user")
+            assert any("Python" in f for f in profile1.facts)
+
+            cache.record(sid, "12345", "小明", "我现在改用 JavaScript 编程了")
+            mgr.submit_chunk(sid, "我现在改用 JavaScript 编程了", "好的")
+            for _ in range(100):
+                await asyncio.sleep(0.05)
+                with mgr._background_tasks_lock:
+                    if not mgr._background_tasks:
+                        break
+
+            profile2 = await mgr.get_profile("telegram:12345", "user")
+            # Raw importance of the correction (3) is below the profile
+            # gate's threshold (7), but it merged into a memory whose final
+            # importance was upgraded to 8 — the profile must reflect that.
+            assert profile2.facts == ["小明改用 JavaScript 编程"]
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_compact_profile_works_with_only_fast_client():
+    """compact_profile must not require the main llm_client — it should run
+    off the fast client alone, matching summarize_profile_facts's own client
+    selection (CodeRabbit: compaction disabled when only fast LLM)."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 3,
+            })
+            await mgr.async_init()
+
+            await mgr.profile_store.update_profile(
+                "telegram:222", facts=["事实一", "事实二", "事实三"]
+            )
+            mgr.extractor.set_fast_llm_client(FakeLLM(["[其他] 精简后的事实"]))
+            assert mgr.extractor._llm_client is None
+
+            compacted = await mgr.compact_profile("telegram:222", "user")
+            assert compacted is True
+
+            p = await mgr.get_profile("telegram:222", "user")
+            assert p.facts == ["[其他] 精简后的事实"]
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_compact_profile_preserves_concurrent_write():
+    """A hippocampus write that lands while the compaction's LLM call is
+    still pending must not be dropped by the replace-all write at the end of
+    compact_profile (Greptile/Codex P1: compaction race)."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 3,
+            })
+            await mgr.async_init()
+
+            bloated = ["小明喜欢被拍头", "小明喜欢被摸头", "小明很喜欢别人摸他的头"]
+            await mgr.profile_store.update_profile("telegram:111", facts=list(bloated))
+
+            summary = "[互动习惯] 喜欢被摸头/拍头"
+            fake = FakeLLM([summary])
+            mgr.set_clients(llm_client=fake, fast_llm_client=fake)
+
+            original_summarize = mgr.extractor.summarize_profile_facts
+
+            async def summarize_and_race(facts, traits=None, max_facts=12):
+                # Simulate a concurrent hippocampus write landing while this
+                # (slow) LLM call is in flight.
+                await mgr.profile_store.add_fact("telegram:111", "小明是一名程序员")
+                return await original_summarize(facts, traits, max_facts=max_facts)
+
+            mgr.extractor.summarize_profile_facts = summarize_and_race
+
+            compacted = await mgr.compact_profile("telegram:111", "user")
+            assert compacted is True
+
+            p = await mgr.get_profile("telegram:111", "user")
+            assert "[互动习惯] 喜欢被摸头/拍头" in p.facts
+            # The concurrently-written fact must survive the compaction's
+            # replace-all write, not be silently dropped.
+            assert "小明是一名程序员" in p.facts
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_apply_compacted_facts_serializes_concurrent_add():
+    """Greptile P1 follow-up: a write that races between re-read and save must
+    still land — per-entity lock serializes apply_compacted_facts with add_fact
+    so the new fact is either merged into the compact write or appended after."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            await store.update_profile(
+                "telegram:111", facts=["事实一", "事实二", "事实三"]
+            )
+            snapshot = ["事实一", "事实二", "事实三"]
+            compacted = ["[其他] 精简后的事实"]
+
+            lock = store._get_entity_lock("telegram:111", "user")
+            await lock.acquire()
+            try:
+                t_apply = asyncio.create_task(
+                    store.apply_compacted_facts(
+                        "telegram:111", "user", snapshot, compacted
+                    )
+                )
+                t_add = asyncio.create_task(
+                    store.add_fact("telegram:111", "压实空窗期写入的新事实")
+                )
+                # Both tasks should be blocked on the entity lock.
+                await asyncio.sleep(0.05)
+                assert not t_apply.done() and not t_add.done()
+            finally:
+                lock.release()
+
+            updated, _ = await asyncio.gather(t_apply, t_add)
+            assert updated is not None
+
+            p = await store.get_profile("telegram:111", "user")
+            assert "[其他] 精简后的事实" in p.facts
+            assert "压实空窗期写入的新事实" in p.facts
+
+    _run(run())
+
+
+def test_compact_profile_result_stays_below_threshold():
+    """After a successful compaction, the resulting fact count must land
+    strictly below the threshold, otherwise the very next check would
+    immediately re-trigger compaction (CodeRabbit: re-compaction loop)."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 3,
+            })
+            await mgr.async_init()
+
+            bloated = ["事实一", "事实二", "事实三", "事实四", "事实五"]
+            await mgr.profile_store.update_profile("telegram:333", facts=list(bloated))
+
+            # A misbehaving model tries to return more lines than the
+            # threshold should allow.
+            summary = "\n".join(f"[其他] 精简事实{i}" for i in range(5))
+            fake = FakeLLM([summary])
+            mgr.set_clients(llm_client=fake, fast_llm_client=fake)
+
+            compacted = await mgr.compact_profile("telegram:333", "user")
+            assert compacted is True
+
+            p = await mgr.get_profile("telegram:333", "user")
+            assert len(p.facts) == 2   # threshold(3) - 1
+            assert not mgr._profile_needs_compaction(p)
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_compact_profile_clipped_line_stays_within_char_trigger():
+    """The ellipsis must count toward the 200-character hard limit.
+
+    A 201-character "200 chars + ellipsis" result immediately exceeded the
+    minimum char trigger and caused every subsequent check to compact again.
+    """
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 99,
+                "profile_compact_max_chars": 200,
+            })
+            await mgr.async_init()
+
+            await mgr.profile_store.update_profile(
+                "telegram:char-limit", facts=["甲" * 101, "乙" * 101]
+            )
+            summary = "[其他] " + "摘要" * 150
+            fake = FakeLLM([summary])
+            mgr.set_clients(llm_client=fake, fast_llm_client=fake)
+
+            assert await mgr.compact_profile("telegram:char-limit", "user") is True
+            profile = await mgr.get_profile("telegram:char-limit", "user")
+            assert len(profile.facts) == 1
+            assert len(profile.facts[0]) <= mgr._compact_max_chars()
+            assert not mgr._profile_needs_compaction(profile)
+
+            await mgr.close()
+
+    _run(run())
+
+
+def test_compact_threshold_clamped_to_at_least_two():
+    """A misconfigured 0/1/negative threshold must clamp to 2 so a single
+    retained fact after compaction does not immediately re-trigger
+    (CodeRabbit: re-compaction loop)."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            mgr = HippocampusManager({
+                "hippocampus_chunk_threshold": 99,
+                "reflection_threshold": 100,
+                "enable_self_awareness": False,
+                "profile_compact_threshold": 0,
+            })
+            await mgr.async_init()
+            assert mgr._compact_threshold() == 2
+
+            await mgr.profile_store.update_profile(
+                "telegram:1", facts=["唯一一条事实"]
+            )
+            p = await mgr.get_profile("telegram:1", "user")
+            assert not mgr._profile_needs_compaction(p)
+            await mgr.close()
+
+    _run(run())
+
+
+def test_apply_compacted_facts_aborts_on_snapshot_conflict():
+    """If a snapshot fact was deleted/replaced during the LLM call, discard
+    the stale summary instead of resurrecting it (CodeRabbit)."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            await store.update_profile(
+                "telegram:111", facts=["事实一", "事实二", "事实三"]
+            )
+            snapshot = ["事实一", "事实二", "事实三"]
+            await store.remove_fact("telegram:111", "事实二")
+            updated = await store.apply_compacted_facts(
+                "telegram:111",
+                "user",
+                snapshot,
+                ["[其他] 过期摘要"],
+            )
+            assert updated is None
+            p = await store.get_profile("telegram:111", "user")
+            assert p.facts == ["事实一", "事实三"]
+            assert "[其他] 过期摘要" not in p.facts
+
+    _run(run())
+
+
+def test_apply_compacted_facts_does_not_recreate_missing_profile():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            snapshot = ["事实一", "事实二"]
+            await store.update_profile("telegram:missing", facts=list(snapshot))
+
+            profile_path = Path(
+                get_entity_profile_path("telegram:missing", "user")
+            )
+            assert await store.delete_profile("telegram:missing", "user")
+            assert not profile_path.exists()
+
+            updated = await store.apply_compacted_facts(
+                "telegram:missing",
+                "user",
+                snapshot,
+                ["[其他] 旧摘要"],
+            )
+
+            assert updated is None
+            assert not profile_path.exists()
+
+    _run(run())
+
+
+def test_get_profile_creation_is_serialized_with_delete():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            profile_path = Path(
+                get_entity_profile_path("telegram:creating", "user")
+            )
+            save_started = asyncio.Event()
+            allow_save = asyncio.Event()
+            original_save = store.save_profile
+
+            async def delayed_save(profile):
+                save_started.set()
+                await allow_save.wait()
+                return await original_save(profile)
+
+            store.save_profile = delayed_save
+            get_task = asyncio.create_task(
+                store.get_profile("telegram:creating", "user")
+            )
+            await save_started.wait()
+
+            delete_task = asyncio.create_task(
+                store.delete_profile("telegram:creating", "user")
+            )
+            await asyncio.sleep(0)
+            assert not delete_task.done()
+
+            allow_save.set()
+            await get_task
+            assert await delete_task is True
+            assert not profile_path.exists()
+
+    _run(run())
+
+
+def test_increment_interaction_does_not_clobber_compacted_facts():
+    """Greptile P1: a stale interaction RMW must not overwrite facts that
+    landed via compaction while the interaction update was in flight."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            await store.update_profile(
+                "telegram:111",
+                facts=["事实一", "事实二", "事实三"],
+                nickname="旧昵称",
+            )
+
+            lock = store._get_entity_lock("telegram:111", "user")
+            await lock.acquire()
+            try:
+                t_inc = asyncio.create_task(
+                    store.increment_interaction(
+                        "telegram:111", nickname="新昵称"
+                    )
+                )
+                t_apply = asyncio.create_task(
+                    store.apply_compacted_facts(
+                        "telegram:111",
+                        "user",
+                        ["事实一", "事实二", "事实三"],
+                        ["[其他] 压实后的事实"],
+                    )
+                )
+                await asyncio.sleep(0.05)
+                assert not t_inc.done() and not t_apply.done()
+            finally:
+                lock.release()
+
+            await asyncio.gather(t_inc, t_apply)
+            p = await store.get_profile("telegram:111", "user")
+            assert "[其他] 压实后的事实" in p.facts
+            assert p.nickname == "新昵称"
+            assert p.interaction_count >= 1
 
     _run(run())

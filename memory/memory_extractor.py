@@ -30,6 +30,49 @@ logger = get_logger("memory_extractor", "green")
 # system prompt stays cheap and can't dominate the context (issue #4).
 _PERSONA_BRIEF_MAX = 800
 
+# Backstop cap on a merged fact/reflection/profile-summary line. The merge
+# and compaction prompts already ask for short output, but a model that
+# ignores instructions must not be able to write an unbounded paragraph.
+_MERGE_MAX_CHARS = 200
+
+# Profile compaction: cap how many bullets a compacted profile keeps, and the
+# tags the LLM is asked to sort facts into.
+_PROFILE_COMPACT_MAX_FACTS = 12
+_PROFILE_FACT_TAGS = ("身份", "性格", "技能兴趣", "互动习惯", "关系", "其他")
+
+
+def _clip_merged(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) > _MERGE_MAX_CHARS:
+        text = text[: _MERGE_MAX_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def _merge_fallback(existing_text: str, new_text: str) -> str:
+    """Bounded fallback that always preserves the new correction."""
+    existing_text = (existing_text or "").strip()
+    new_text = _clip_merged(new_text)
+    if not existing_text:
+        return new_text
+    if not new_text:
+        return _clip_merged(existing_text)
+
+    separator = "；"
+    if len(existing_text) + len(separator) + len(new_text) <= _MERGE_MAX_CHARS:
+        return f"{existing_text}{separator}{new_text}"
+
+    existing_budget = _MERGE_MAX_CHARS - len(separator) - len(new_text)
+    if existing_budget <= 0:
+        return new_text
+    if len(existing_text) > existing_budget:
+        if existing_budget == 1:
+            existing_text = "…"
+        else:
+            existing_text = (
+                existing_text[: existing_budget - 1].rstrip() + "…"
+            )
+    return f"{existing_text}{separator}{new_text}"
+
 
 class MemoryExtractor:
     """海马体：事实提取 → 去重 → 合并 → 升维"""
@@ -110,7 +153,10 @@ class MemoryExtractor:
             return []
 
         prompt = f"""分析以下对话片段，提取每位用户的**个人事实**。忽略寒暄和无意义内容。
-对话中每位用户的格式为 "昵称(ID): 内容"，请注意区分不同用户。
+对话中每位用户的格式为 "昵称(ID): 内容"，请注意区分不同用户。如果对话前面附带
+"## 参与者已知信息" 或 "## 已有相关记忆" 部分，那是该用户已经记录过的内容——
+**不要重复提取其中已经覆盖的信息**；只有出现实质性新变化或补充时才提取，且只
+写变化点本身，不要重复旧信息的细节。
 
 只关注个人层面的信息，包括：
 - 用户的偏好、喜好、厌恶
@@ -119,13 +165,20 @@ class MemoryExtractor:
 - 观点、立场
 - 习惯、性格特征
 
+**格式要求**：
+- 每条事实是一句**原子短句**（≤40 字），一事实一事，不要用"并且/而且/还"
+  把多件事拼进一条
+- 反复出现的互动习惯（比如"喜欢拍/摸 bot 的头"这类动作）只记录一次稳定
+  模式，不要因为对话里发生了好几次就写好几条相似的事实——这几轮如果已经
+  记过同类习惯，这轮就不用再写
+
 对话:
 {conversation_text}
 
 请以 JSON 数组格式输出，每条事实包含：
 - "speaker_id": 该事实所属用户的 ID（从对话中括号内提取，如 "12345"）
 - "subject": 该用户的昵称
-- "content": 事实描述，用该用户昵称作主语，写成完整陈述句。例如：✅ "小明喜欢用Python" ✅ "阿花是一名大三学生" ❌ "该用户喜欢Python"（禁止使用"该用户"）
+- "content": 事实描述，用该用户昵称作主语，写成简短陈述句（≤40字）。例如：✅ "小明喜欢用Python" ✅ "阿花是一名大三学生" ❌ "该用户喜欢Python"（禁止使用"该用户"）
 - "importance": 重要性评分(1-10)
 - "tags": 相关标签数组
 - "semantic_id": 简短 snake_case 标识符（如 "xiaoming_likes_python"）
@@ -165,7 +218,9 @@ class MemoryExtractor:
         ) if persona_system else ""
 
         prompt = f"""分析以下群聊对话片段，提取**群组级别**的信息。忽略寒暄和无意义内容。
-对话中每位用户的格式为 "昵称(ID): 内容"。
+对话中每位用户的格式为 "昵称(ID): 内容"。如果对话前面附带 "## 参与者已知信息"
+或 "## 已有相关记忆" 部分，那是已经记录过的内容——**不要重复提取其中已经覆盖的
+信息**，只有出现实质性新变化时才提取，且只写变化点本身。
 
 只关注群聊层面的信息，包括：
 - 群聊的常见话题和讨论方向
@@ -173,6 +228,11 @@ class MemoryExtractor:
 - 成员之间的互动关系和社交动态（如"小明和阿花经常互怼"）
 - 群内的共识、群规、惯例
 - 群内事件（如群友组织活动、群聊里发生的趣事）
+
+**格式要求**：
+- 每条事实是一句**原子短句**（≤40 字），一事实一事
+- 反复出现的互动模式（比如某人反复刷屏、某两人反复互怼）只记录一次稳定
+  模式，不要为每次发生单独写一条
 {persona_clause}
 对话:
 {conversation_text}
@@ -180,7 +240,7 @@ class MemoryExtractor:
 请以 JSON 数组格式输出，每条事实包含：
 - "speaker_id": 留空 ""
 - "subject": "group"
-- "content": 事实描述，写成关于群聊的完整陈述句。涉及具体成员时必须用昵称，例如：✅ "群里最近在讨论AI绘画" ✅ "小明和阿花经常在群里互怼" ✅ "群友们普遍偏好深夜聊天" ❌ "该用户经常发言"（禁止使用"该用户"，且这不是群级信息）
+- "content": 事实描述，写成关于群聊的简短陈述句（≤40字）。涉及具体成员时必须用昵称，例如：✅ "群里最近在讨论AI绘画" ✅ "小明和阿花经常在群里互怼" ✅ "群友们普遍偏好深夜聊天" ❌ "该用户经常发言"（禁止使用"该用户"，且这不是群级信息）
 - "importance": 重要性评分(1-10)
 - "tags": 相关标签数组
 - "semantic_id": 简短 snake_case 标识符（如 "group_discusses_ai_art"）
@@ -207,7 +267,13 @@ class MemoryExtractor:
             return []
 
         prompt = f"""分析以下对话片段，提取关键事实。忽略寒暄和无意义内容。
-对话中用户的格式为 "昵称(ID): 内容"。
+对话中用户的格式为 "昵称(ID): 内容"。如果对话前面附带 "## 参与者已知信息" 或
+"## 已有相关记忆" 部分，那是已经记录过的内容——**不要重复提取其中已经覆盖的
+信息**，只有出现实质性新变化或补充时才提取，且只写变化点本身。
+
+**格式要求**：
+- 每条事实是一句**原子短句**（≤40 字），一事实一事
+- 反复出现的互动习惯只记录一次稳定模式，不要为每次发生单独写一条
 
 对话:
 {conversation_text}
@@ -215,7 +281,7 @@ class MemoryExtractor:
 请以 JSON 数组格式输出，每条事实包含：
 - "speaker_id": 该事实所属用户的 ID（从对话中括号内提取，如 "12345"）
 - "subject": 该用户的昵称
-- "content": 事实描述，用昵称作主语，写成完整陈述句。例如：✅ "小明喜欢吃辣" ❌ "该用户喜欢吃辣"
+- "content": 事实描述，用昵称作主语，写成简短陈述句（≤40字）。例如：✅ "小明喜欢吃辣" ❌ "该用户喜欢吃辣"
 - "importance": 重要性评分(1-10)
 - "tags": 相关标签数组
 - "semantic_id": 简短 snake_case 标识符（如 "xiaoming_likes_spicy"）
@@ -359,7 +425,27 @@ class MemoryExtractor:
         )
         if exact_match:
             logger.debug(f"Exact hash match: {new_content[:50]}...")
-            return "duplicate", None
+            matched = Memory(
+                id=exact_match["id"],
+                type=exact_match.get("memory_type", "fact"),
+                text=exact_match.get("raw_text", new_content),
+                importance=exact_match.get("importance", 5),
+                tags=exact_match.get("tags", []),
+                source=exact_match.get("source", {}),
+                meta={
+                    "importance": exact_match.get("importance", 5),
+                    "timestamp": exact_match.get("timestamp", 0),
+                    "access_count": exact_match.get("access_count", 0),
+                    "last_accessed": exact_match.get("last_accessed", 0),
+                    "tags": exact_match.get("tags", []),
+                    "source": exact_match.get("source", {}),
+                },
+                _entity_id=exact_match.get("entity_id", entity_id),
+                _entity_type=exact_match.get("entity_type", entity_type),
+                _folder=exact_match.get("folder", folder),
+                _base_dir=exact_match.get("base_dir", ""),
+            )
+            return "duplicate", matched
 
         # === 第二级：FTS5 语义搜索 + LLM 判断（多候选） ===
         existing = await self.tree_store.search(
@@ -394,8 +480,11 @@ class MemoryExtractor:
 新信息: {new_content}
 
 只输出以下三个选项之一：
-- "duplicate"：新信息与已有信息基本相同，无需记录
-- "update"：新信息是对已有信息的更新或补充，需要合并
+- "duplicate"：新信息与已有信息基本相同，或只是同一习惯/事实的不同措辞，
+  无需记录。例如「喜欢被摸头」和「喜欢别人拍他的头」是同一习惯的不同说法，
+  应判定为 duplicate；「今天又被摸头了」和「喜欢被摸头」也是同一习惯的
+  不同表述，同样是 duplicate
+- "update"：新信息是对已有信息的更新、补充或程度变化，需要合并
 - "new"：新信息与已有信息无关，是全新信息
 
 只输出选项文本，不要有其他内容。"""
@@ -413,25 +502,30 @@ class MemoryExtractor:
     # ==========================================
 
     async def merge_facts(self, existing_text: str, new_text: str) -> str:
-        """LLM 合并两条事实为一条（使用快速模型）"""
+        """LLM 合并两条事实为一条（使用快速模型），目标是更短而不是更长。
+
+        代码层加保险性硬截断（``_clip_merged``），不完全依赖提示词自觉——
+        模型不听话仍写长文本时，也不会让画像/记忆无限膨胀。
+        """
         client = self._fast_or_default
         if not client:
-            return f"{existing_text}；{new_text}"
+            return _merge_fallback(existing_text, new_text)
 
-        prompt = f"""将以下两条信息合并为一条，保留所有有用信息：
+        prompt = f"""将以下两条信息合并为一条**更短**的陈述，删除同义重复的内容，
+禁止堆砌举例或罗列多次发生的细节，只保留最新、最准确的结论：
 
 已有信息: {existing_text}
 新信息: {new_text}
 
-直接输出合并后的结果，不要有其他内容。"""
+直接输出合并后的结果（尽量控制在 40 字以内），不要有其他内容。"""
 
         try:
             merged = (await chat_text(client, prompt)).strip()
             if merged:
-                return merged
+                return _clip_merged(merged)
         except Exception as e:
             logger.error(f"Merge facts error: {e}")
-        return f"{existing_text}；{new_text}"
+        return _merge_fallback(existing_text, new_text)
 
     # ==========================================
     # 去重并存储（完整流程）
@@ -452,13 +546,43 @@ class MemoryExtractor:
             决策结果 "skip" | "duplicate" | "update" | "new"，供调用方（如手动
             memory_add 工具）反馈给用户/模型。后台海马体流程忽略此返回值。
         """
+        decision, _final_text, _final_importance = await self.deduplicate_and_store_ex(
+            fact, entity_id, entity_type
+        )
+        return decision
+
+    async def deduplicate_and_store_ex(
+        self,
+        fact: dict,
+        entity_id: str,
+        entity_type: str = "user",
+    ) -> tuple[str, str, int]:
+        """同 ``deduplicate_and_store``，但额外返回最终落地的文本和重要性。
+
+        画像 upsert（画像去重精简 #2）需要在 "update" 时用**合并后**的文本
+        播种画像，而不是合并前的原始提取——否则画像会绕开 TOML 侧刚做完的
+        去重结果，重新写入一份近义原文。同理，"update" 决策下 TOML 侧落地的
+        重要性可能已被旧记忆的更高重要性抬升过（见下方 ``max(importance,
+        matched.importance)``），画像门槛判断必须用这个最终值而不是这次
+        提取的原始 ``fact["importance"]``，否则一条低重要性的更正合并进
+        高重要性记忆后，画像却会因为原始重要性不够而错过同步
+        （CodeRabbit：profile gate uses raw importance）。
+
+        Returns:
+            (decision, final_text, final_importance)
+            decision: "skip" | "duplicate" | "update" | "new"
+            final_text: "duplicate" → 命中的旧记忆原文；"update" → 合并后的
+            文本（若落盘失败则回退为旧记忆原文，见下）；"new"/"skip" → 传入
+            的 content（"skip" 时为空串）
+            final_importance: 与 final_text 对应的重要性；"skip" 时为 0
+        """
         content = fact.get("content", "")
         importance = fact.get("importance", 5)
         tags = fact.get("tags", [])
         semantic_id = fact.get("semantic_id", "")
 
         if not content:
-            return "skip"
+            return "skip", "", 0
 
         decision, matched = await self.deduplicate(
             content, entity_id, entity_type, "facts"
@@ -466,13 +590,23 @@ class MemoryExtractor:
 
         if decision == "duplicate":
             logger.debug(f"Duplicate memory skipped: {content[:50]}...")
-            return "duplicate"
+            if matched:
+                return "duplicate", matched.text, matched.importance
+            return "duplicate", content, importance
 
         if decision == "update" and matched:
-            # 合并后更新旧记忆
+            # 合并前先留一份旧值：如果落盘失败，TOML 侧仍是旧文本/旧重要性，
+            # 绝不能对外报告一个从未真正写入的合并结果（CodeRabbit outside-diff：
+            # update_memory fail still returns "update"）。
+            original_text = matched.text
+            original_importance = matched.importance
+            original_tags = set(matched.tags)
+
             merged_text = await self.merge_facts(matched.text, content)
+            final_importance = max(importance, matched.importance)
+
             matched.text = merged_text
-            matched.importance = max(importance, matched.importance)
+            matched.importance = final_importance
             matched.meta["last_accessed"] = time.time()
 
             # 合并 tags
@@ -480,11 +614,31 @@ class MemoryExtractor:
             existing_tags.update(tags)
             matched.tags = list(existing_tags)
 
-            if await self.tree_store.update_memory(matched):
-                logger.info(f"Memory merged: id={matched.id}")
-            else:
+            if not await self.tree_store.update_memory(matched):
                 logger.warning(f"Failed to merge memory {matched.id}")
-            return "update"
+                # update_memory 先写 TOML 再更新索引：False 可能是部分成功
+                # （TOML 已是合并结果、索引失败）。重读磁盘，按真实落盘值
+                # 同步画像，避免 TOML / 索引 / 画像三分叉（CodeRabbit）。
+                try:
+                    persisted = await self.tree_store.get_memory(
+                        matched.id,
+                        entity_id=matched._entity_id,
+                        entity_type=matched._entity_type,
+                        folder=matched._folder,
+                        base_dir=matched._base_dir or "",
+                    )
+                except Exception:
+                    persisted = None
+                if persisted is not None and (
+                    persisted.text != original_text
+                    or persisted.importance != original_importance
+                    or set(persisted.tags) != original_tags
+                ):
+                    return "update", persisted.text, persisted.importance
+                return "skip", original_text, original_importance
+
+            logger.info(f"Memory merged: id={matched.id}")
+            return "update", merged_text, final_importance
 
         # 全新事实 → 写入
         # 尝试获取语义 ID
@@ -502,7 +656,7 @@ class MemoryExtractor:
             folder="facts",
         )
         logger.info(f"New fact stored for {entity_type}:{entity_id}")
-        return "new"
+        return "new", content, importance
 
     # ==========================================
     # 信息升维（宪章铁律 #2）
@@ -627,6 +781,77 @@ class MemoryExtractor:
             logger.error(f"Reflection generation error: {e}")
 
         return generated
+
+    # ==========================================
+    # 画像压实（画像去重精简 #3）
+    # ==========================================
+
+    async def summarize_profile_facts(
+        self,
+        facts: list[str],
+        traits: Optional[list[str]] = None,
+        max_facts: int = _PROFILE_COMPACT_MAX_FACTS,
+    ) -> list[str]:
+        """把冗长/重复的画像 facts 压实为带 "[标签]" 前缀的规范短句列表。
+
+        用于修复已经膨胀的存量画像（例如同一个习惯被反复用不同话描述好几遍）。
+        解析失败或空输出时返回 ``[]``——调用方（``HippocampusManager.compact_profile``）
+        必须据此保留原值，绝不能用空列表覆盖已有画像。
+
+        ``max_facts`` 由调用方按压实阈值动态传入（而非固定用模块常量），否则
+        压实后 facts 数量仍可能 ≥ 阈值，导致下一次写入立刻再次触发压实
+        （CodeRabbit：re-compaction loop）。
+        """
+        client = self._fast_or_default
+        if not client or not facts:
+            return []
+        max_facts = max(1, max_facts)
+
+        facts_text = "\n".join(f"- {f}" for f in facts)
+        traits_text = f"\n已有特征标签: {', '.join(traits)}" if traits else ""
+        tags = "、".join(_PROFILE_FACT_TAGS)
+
+        prompt = f"""以下是关于同一个人的一份画像事实列表，其中可能有重复、同义
+或过于细碎的内容（比如同一个习惯被反复用不同话描述了好几次）。请把它们去重、
+合并、精简为规范的短句列表。
+
+规则：
+- 每条不超过 30 字，一条只说一件事
+- 同义/重复内容只保留一条最准确的表述，不要罗列发生了几次
+- 每条前面加一个 "[标签]" 前缀，标签从以下几类中选：{tags}
+- 按重要性排序，最多输出 {max_facts} 条
+- 不要编造原始列表里没有的信息
+
+原始事实列表:
+{facts_text}{traits_text}
+
+只输出结果，每行一条，格式为 "[标签] 内容"，不要有编号、不要有其他说明文字。"""
+
+        try:
+            text = (await chat_text(client, prompt)).strip()
+            if not text:
+                return []
+            lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+            cleaned = []
+            for ln in lines:
+                # 容错去掉模型可能加的项目符号/编号前缀。
+                ln = re.sub(r"^[-*\d.\s]+(?=\[)", "", ln).strip()
+                if not ln:
+                    continue
+                # 只接受「[允许的标签] 非空内容」这种规范格式；拒绝语、裸 JSON、
+                # 未打标签的文本等一律视为解析失败整体返回 []，而不是自动包装
+                # 成 "[其他]" 事实去覆盖原始画像（Greptile/CodeRabbit：untagged
+                # LLM output accepted）。
+                match = re.fullmatch(r"\[([^\]\n]+)\]\s+(\S.*)", ln)
+                if match is None or match.group(1) not in _PROFILE_FACT_TAGS:
+                    return []
+                cleaned.append(_clip_merged(ln))
+            if not cleaned:
+                return []
+            return cleaned[:max_facts]
+        except Exception as e:
+            logger.error(f"Profile compaction summarize error: {e}")
+            return []
 
     # ==========================================
     # 工具方法

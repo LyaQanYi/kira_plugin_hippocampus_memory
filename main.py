@@ -862,6 +862,21 @@ class HippocampusMemoryPlugin(BasePlugin):
         deleted, downgraded = await self._manager.run_forgetting_cycle()
         return {"deleted": deleted, "downgraded": downgraded}
 
+    @register.api(method="POST", path="/profile/{entity_id}/compact", auth=True)
+    async def api_compact_profile(
+        self, entity_id: str, entity_type: str = "user"
+    ) -> Dict[str, Any]:
+        """手动触发单个实体的画像压实，便于修复已知很水的画像而不用等定时周期。"""
+        if self._manager is None:
+            return {"error": "not initialized"}
+        try:
+            compacted = await self._manager.compact_profile(
+                entity_id, entity_type, force=True
+            )
+        except Exception as e:
+            return {"error": str(e)}
+        return {"compacted": compacted}
+
     @register.api(method="POST", path="/evolution/run", auth=True)
     async def api_run_evolution(self) -> Dict[str, Any]:
         if self._manager is None:

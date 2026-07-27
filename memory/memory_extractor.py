@@ -48,6 +48,32 @@ def _clip_merged(text: str) -> str:
     return text
 
 
+def _merge_fallback(existing_text: str, new_text: str) -> str:
+    """Bounded fallback that always preserves the new correction."""
+    existing_text = (existing_text or "").strip()
+    new_text = _clip_merged(new_text)
+    if not existing_text:
+        return new_text
+    if not new_text:
+        return _clip_merged(existing_text)
+
+    separator = "；"
+    if len(existing_text) + len(separator) + len(new_text) <= _MERGE_MAX_CHARS:
+        return f"{existing_text}{separator}{new_text}"
+
+    existing_budget = _MERGE_MAX_CHARS - len(separator) - len(new_text)
+    if existing_budget <= 0:
+        return new_text
+    if len(existing_text) > existing_budget:
+        if existing_budget == 1:
+            existing_text = "…"
+        else:
+            existing_text = (
+                existing_text[: existing_budget - 1].rstrip() + "…"
+            )
+    return f"{existing_text}{separator}{new_text}"
+
+
 class MemoryExtractor:
     """海马体：事实提取 → 去重 → 合并 → 升维"""
 
@@ -483,7 +509,7 @@ class MemoryExtractor:
         """
         client = self._fast_or_default
         if not client:
-            return _clip_merged(f"{existing_text}；{new_text}")
+            return _merge_fallback(existing_text, new_text)
 
         prompt = f"""将以下两条信息合并为一条**更短**的陈述，删除同义重复的内容，
 禁止堆砌举例或罗列多次发生的细节，只保留最新、最准确的结论：
@@ -499,7 +525,7 @@ class MemoryExtractor:
                 return _clip_merged(merged)
         except Exception as e:
             logger.error(f"Merge facts error: {e}")
-        return _clip_merged(f"{existing_text}；{new_text}")
+        return _merge_fallback(existing_text, new_text)
 
     # ==========================================
     # 去重并存储（完整流程）

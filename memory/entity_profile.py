@@ -29,6 +29,7 @@ logger = get_logger("entity_profile", "green")
 # ask the LLM for short text, but a model that ignores instructions must not
 # be able to write an unbounded paragraph into the profile.
 _FACT_MAX_CHARS = 200
+_UPSERT_MAX_RETRIES = 3
 
 # Matches a "[标签] 内容" prefix left by profile compaction, so to_prompt() can
 # group facts by tag instead of dumping an unbounded flat bullet list.
@@ -347,7 +348,9 @@ class EntityProfileStore:
         未提供 ``conflict_check``（如未配置 LLM）时退化为精确去重 + 直接追加，
         保证在没有 LLM 的情况下也能正常工作。
 
-        整段 RMW 持有 per-entity 锁，与 ``apply_compacted_facts`` 互斥。
+        LLM conflict/merge calls run outside the per-entity lock. Each attempt
+        snapshots facts under the lock, performs model work without it, then
+        uses a short compare-and-swap section to preserve concurrent mutations.
 
         Returns: "duplicate" | "update" | "new" | "skip" | "error"（"error" =
         决策已判定但落盘失败——调用方不能把它当成功处理，见 ``save_profile``
@@ -360,19 +363,35 @@ class EntityProfileStore:
         if not fact:
             return "skip"
 
-        async with self._get_entity_lock(entity_id, entity_type):
-            profile = await self.get_profile(entity_id, entity_type)
+        normalized = fact.lower()
+        entity_lock = self._get_entity_lock(entity_id, entity_type)
 
-            normalized = fact.lower()
-            for existing in profile.facts:
-                if existing.strip().lower() == normalized:
+        for _attempt in range(_UPSERT_MAX_RETRIES):
+            async with entity_lock:
+                profile = await self.get_profile(entity_id, entity_type)
+                if any(
+                    existing.strip().lower() == normalized
+                    for existing in profile.facts
+                ):
                     return "duplicate"
 
-            if conflict_check is None or not profile.facts:
-                profile.facts.append(fact)
-                return "new" if await self.save_profile(profile) else "error"
+                snapshot = list(profile.facts)
+                if conflict_check is None or not snapshot:
+                    profile.facts.append(fact)
+                    return (
+                        "new"
+                        if await self.save_profile(profile)
+                        else "error"
+                    )
 
-            candidates = _rank_candidates(fact, profile.facts, candidate_k)
+            # Model calls can take seconds and must never hold the entity lock:
+            # interaction updates for the live user share the same lock.
+            candidates = _rank_candidates(fact, snapshot, candidate_k)
+            action = "new"
+            target_idx = -1
+            target_existing = ""
+            replacement = ""
+
             for idx, existing in candidates:
                 try:
                     decision = await conflict_check(fact, existing)
@@ -381,31 +400,71 @@ class EntityProfileStore:
                         f"Profile upsert conflict_check failed: {type(e).__name__}"
                     )
                     continue
+                if decision not in ("duplicate", "update"):
+                    continue
+
+                target_idx = idx
+                target_existing = existing
                 if replace_on_duplicate and decision in ("duplicate", "update"):
-                    profile.facts[idx] = fact
-                    return (
-                        "update"
-                        if await self.save_profile(profile)
-                        else "error"
-                    )
-                if decision == "duplicate":
-                    return "duplicate"
-                if decision == "update":
+                    action = "update"
+                    replacement = fact
+                elif decision == "duplicate":
+                    action = "duplicate"
+                else:
+                    action = "update"
                     if merge is not None:
                         try:
-                            merged = await merge(existing, fact)
+                            replacement = _clip_fact(
+                                await merge(existing, fact)
+                            )
                         except Exception as e:
                             logger.debug(
                                 f"Profile upsert merge failed: {type(e).__name__}"
                             )
                             return "error"
                     else:
-                        merged = f"{existing}；{fact}"
-                    profile.facts[idx] = _clip_fact(merged)
-                    return "update" if await self.save_profile(profile) else "error"
+                        replacement = _clip_fact(f"{existing}；{fact}")
+                    if not replacement:
+                        return "error"
+                break
 
-            profile.facts.append(fact)
-            return "new" if await self.save_profile(profile) else "error"
+            async with entity_lock:
+                current = await self.get_profile(entity_id, entity_type)
+                if any(
+                    existing.strip().lower() == normalized
+                    for existing in current.facts
+                ):
+                    return "duplicate"
+
+                if action == "new":
+                    if current.facts != snapshot:
+                        continue
+                    current.facts.append(fact)
+                    return (
+                        "new"
+                        if await self.save_profile(current)
+                        else "error"
+                    )
+
+                if (
+                    target_idx >= len(current.facts)
+                    or current.facts[target_idx] != target_existing
+                ):
+                    continue
+                if action == "duplicate":
+                    return "duplicate"
+
+                current.facts[target_idx] = replacement
+                return (
+                    "update"
+                    if await self.save_profile(current)
+                    else "error"
+                )
+
+        logger.debug(
+            f"Profile upsert CAS retries exhausted for {entity_type}:{entity_id}"
+        )
+        return "error"
 
     async def update_fact(
         self, entity_id: str, old_fact: str, new_fact: str, entity_type: str = ENTITY_USER

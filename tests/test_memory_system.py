@@ -1767,6 +1767,98 @@ def test_profile_upsert_authoritative_replacement_skips_second_merge():
     _run(run())
 
 
+def test_merge_fallback_preserves_new_fact_when_llm_fails():
+    class FailingLLM:
+        async def chat(self, req):
+            raise RuntimeError("merge unavailable")
+
+    async def run():
+        ext = MemoryExtractor(_StubStore())
+        ext.set_fast_llm_client(FailingLLM())
+        new_fact = "这是不能丢失的新更正"
+
+        merged = await ext.merge_facts("旧事实" * 100, new_fact)
+
+        assert new_fact in merged
+        assert len(merged) <= 200
+
+    _run(run())
+
+
+def test_profile_upsert_releases_entity_lock_during_llm_calls():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            entity_id = "user-slow-check"
+            await store.update_profile(entity_id, facts=["原有事实"])
+
+            check_started = asyncio.Event()
+            release_check = asyncio.Event()
+
+            async def slow_conflict_check(new, existing):
+                check_started.set()
+                await release_check.wait()
+                return "duplicate"
+
+            upsert_task = asyncio.create_task(
+                store.upsert_fact(
+                    entity_id,
+                    "近义的新事实",
+                    conflict_check=slow_conflict_check,
+                )
+            )
+            try:
+                await asyncio.wait_for(check_started.wait(), timeout=1)
+                await asyncio.wait_for(
+                    store.increment_interaction(entity_id),
+                    timeout=1,
+                )
+            finally:
+                release_check.set()
+
+            assert await upsert_task == "duplicate"
+            profile = await store.get_profile(entity_id, "user")
+            assert profile.interaction_count == 1
+
+    _run(run())
+
+
+def test_profile_upsert_retries_after_concurrent_fact_change():
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            store = EntityProfileStore()
+            entity_id = "user-cas-retry"
+            await store.update_profile(entity_id, facts=["原有事实"])
+            injected = False
+
+            async def conflict_check(new, existing):
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    await store.add_fact(entity_id, "并发写入的事实")
+                return "new"
+
+            result = await store.upsert_fact(
+                entity_id,
+                "本次新增事实",
+                conflict_check=conflict_check,
+            )
+
+            assert result == "new"
+            profile = await store.get_profile(entity_id, "user")
+            assert profile.facts == [
+                "原有事实",
+                "并发写入的事实",
+                "本次新增事实",
+            ]
+
+    _run(run())
+
+
 def test_profile_upsert_failure_skips_post_write_compaction():
     async def run():
         with tempfile.TemporaryDirectory() as tmp:

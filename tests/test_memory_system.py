@@ -644,6 +644,12 @@ def test_extract_query_uses_persistent_prompt_then_legacy_fallback():
     )
     assert HippocampusMemoryPlugin._extract_query(req) == "兼容调用的用户问题"
 
+    req = types.SimpleNamespace(
+        user_prompt=[_FakePrompt("")],
+        messages=[{"role": "user", "content": "空占位符后的用户问题"}],
+    )
+    assert HippocampusMemoryPlugin._extract_query(req) == "空占位符后的用户问题"
+
 
 class _FakeSender:
     def __init__(self, user_id):

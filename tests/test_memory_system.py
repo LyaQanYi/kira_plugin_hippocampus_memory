@@ -1979,6 +1979,68 @@ def test_deduplicate_and_store_ex_returns_skip_when_merge_persist_fails():
     _run(run())
 
 
+def test_deduplicate_and_store_ex_keeps_persisted_metadata_update():
+    """A TOML-only importance/tag update remains successful when the index
+    write fails, even if the merged wording itself is unchanged."""
+    async def run():
+        with tempfile.TemporaryDirectory() as tmp:
+            set_memory_root(tmp)
+            ensure_directory_structure()
+            from plugins.kira_plugin_hippocampus_memory.memory.paths import (
+                get_index_db_path,
+            )
+            store = TomlTreeStore(index=MemoryIndex(db_path=get_index_db_path()))
+            ext = MemoryExtractor(store)
+
+            memory = await store.add_memory(
+                content_text="小明喜欢用 Python 编程",
+                memory_type="fact",
+                importance=5,
+                tags=["preference"],
+                entity_id="telegram:111",
+                entity_type="user",
+                folder="facts",
+            )
+
+            fake = FakeLLM(["update", memory.text])
+            ext.set_llm_client(fake)
+            ext.set_fast_llm_client(fake)
+
+            def _failing_index_upsert(**kwargs):
+                raise RuntimeError("index unavailable")
+
+            store.index.upsert = _failing_index_upsert
+
+            fact = {
+                "content": "小明一直喜欢用 Python 编程",
+                "importance": 9,
+                "tags": ["confirmed"],
+            }
+            decision, final_text, final_importance = (
+                await ext.deduplicate_and_store_ex(
+                    fact, "telegram:111", "user"
+                )
+            )
+
+            assert decision == "update"
+            assert final_text == memory.text
+            assert final_importance == 9
+
+            persisted = await store.get_memory(
+                memory.id,
+                entity_id="telegram:111",
+                entity_type="user",
+                folder="facts",
+            )
+            assert persisted is not None
+            assert persisted.importance == 9
+            assert set(persisted.tags) == {"preference", "confirmed"}
+
+            store.close()
+
+    _run(run())
+
+
 def test_profile_gate_uses_final_merged_importance_not_raw():
     """A low-importance correction (importance=3) that TOML-side merges into
     an existing high-importance memory (upgraded via ``max(...)``) must still

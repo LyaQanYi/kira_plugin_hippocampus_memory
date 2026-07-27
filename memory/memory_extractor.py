@@ -600,6 +600,7 @@ class MemoryExtractor:
             # update_memory fail still returns "update"）。
             original_text = matched.text
             original_importance = matched.importance
+            original_tags = set(matched.tags)
 
             merged_text = await self.merge_facts(matched.text, content)
             final_importance = max(importance, matched.importance)
@@ -628,7 +629,11 @@ class MemoryExtractor:
                     )
                 except Exception:
                     persisted = None
-                if persisted is not None and persisted.text != original_text:
+                if persisted is not None and (
+                    persisted.text != original_text
+                    or persisted.importance != original_importance
+                    or set(persisted.tags) != original_tags
+                ):
                     return "update", persisted.text, persisted.importance
                 return "skip", original_text, original_importance
 

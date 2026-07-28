@@ -1,10 +1,10 @@
 {
     "display_name": "Hippocampus Memory",
     "plugin_id": "kira_plugin_hippocampus_memory",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "author": "humiao2007@gmail.com",
     "description": "Dual-brain long-term memory: TOML+SQLite/FTS5 store, hippocampus extraction, dimensional reflection, decay-forgetting, entity profiles, three-tier persona evolution. Ports KiraAI-lightning memory system.",
-    "repo": null,
+    "repo": "https://github.com/LyaQanYi/kira_plugin_hippocampus_memory",
     "tags": ["memory", "hippocampus", "ltm"],
     "uninstallable": true,
     "locales": {
